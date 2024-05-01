@@ -664,7 +664,7 @@ impl DFSchema {
             | (DataType::LargeList(f1), DataType::LargeList(f2))
             | (DataType::FixedSizeList(f1, _), DataType::FixedSizeList(f2, _))
             | (DataType::Map(f1, _), DataType::Map(f2, _)) => {
-                Self::field_is_logically_equal(f1, f2)
+                Self::datatype_is_logically_equal(f1.data_type(), f2.data_type())
             }
             (DataType::Struct(fields1), DataType::Struct(fields2)) => {
                 let iter1 = fields1.iter();
