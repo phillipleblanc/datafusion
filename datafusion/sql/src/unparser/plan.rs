@@ -437,6 +437,8 @@ impl Unparser<'_> {
                 Expr::Sort(sort_expr) => {
                     let col = self.expr_to_sql(&sort_expr.expr)?;
 
+                    // TODO see if the column is a compound identifier and the next node is a UNION
+
                     let nulls_first = if self.dialect.supports_nulls_first_in_sort() {
                         Some(sort_expr.nulls_first)
                     } else {

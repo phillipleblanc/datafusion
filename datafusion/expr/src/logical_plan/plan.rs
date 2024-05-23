@@ -2686,7 +2686,7 @@ fn calc_func_dependencies_for_project(
 }
 
 /// Sorts its input according to a list of sort expressions.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Sort {
     /// The sort expressions
     pub expr: Vec<Expr>,

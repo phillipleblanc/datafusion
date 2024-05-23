@@ -4663,7 +4663,7 @@ fn roundtrip_statement() -> Result<()> {
             UNION ALL
             SELECT j2_string as string FROM j2
             ORDER BY string DESC
-            LIMIT 10"#
+            LIMIT 10"#,
         ];
 
     // For each test sql string, we transform as follows:
@@ -4749,6 +4749,26 @@ fn roundtrip_statement_with_dialect() -> Result<()> {
         TestStatementWithDialect {
             sql: "select ta.j1_id from j1 ta order by j1_id limit 10;",
             expected: r#"SELECT ta.j1_id FROM j1 AS ta ORDER BY ta.j1_id ASC NULLS LAST LIMIT 10"#,
+            parser_dialect: Box::new(GenericDialect {}),
+            unparser_dialect: Box::new(UnparserDefaultDialect {}),
+        },
+        TestStatementWithDialect {
+            sql: "SELECT j1_string as string FROM j1
+            UNION ALL
+            SELECT j2_string as string FROM j2
+            ORDER BY string DESC
+            LIMIT 10",
+            expected: r#"SELECT j1.j1_string AS "string" FROM j1 UNION ALL SELECT j2.j2_string AS "string" FROM j2 ORDER BY "string" DESC NULLS FIRST LIMIT 10"#,
+            parser_dialect: Box::new(GenericDialect {}),
+            unparser_dialect: Box::new(UnparserDefaultDialect {}),
+        },
+        TestStatementWithDialect {
+            sql: "SELECT j1_string FROM j1
+            UNION ALL
+            SELECT j2_string as j1_string FROM j2
+            ORDER BY j1_string DESC
+            LIMIT 10",
+            expected: r#"SELECT j1.j1_string FROM j1 UNION ALL SELECT j2.j2_string AS j1_string FROM j2 ORDER BY j1_string DESC NULLS FIRST LIMIT 10"#,
             parser_dialect: Box::new(GenericDialect {}),
             unparser_dialect: Box::new(UnparserDefaultDialect {}),
         },
