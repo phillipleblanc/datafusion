@@ -4826,6 +4826,32 @@ fn test_table_references_in_plan_to_sql() {
     );
 }
 
+#[test]
+fn test_col_references_subquery_alias_in_plan_to_sql() {
+    fn test(table_name: &str, expected_sql: &str) {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("col_a", DataType::Utf8, false),
+        ]);
+        let plan = table_scan(Some(table_name), &schema, None)
+            .unwrap()
+            .alias(TableReference::partial("foo", "tbl"))
+            .unwrap()
+            .project(vec![col("id"), col("col_a")])
+            .unwrap()
+            .build()
+            .unwrap();
+        let sql = plan_to_sql(&plan).unwrap();
+
+        assert_eq!(format!("{}", sql), expected_sql)
+    }
+
+    test(
+        "real_table",
+        "SELECT tbl.id, tbl.col_a FROM real_table AS tbl",
+    );
+}
+
 #[cfg(test)]
 #[ctor::ctor]
 fn init() {
