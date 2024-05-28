@@ -263,6 +263,7 @@ impl CommonSubexprEliminate {
         Ok(plan)
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     fn try_optimize_aggregate(
         &self,
         aggregate: &Aggregate,
@@ -531,6 +532,7 @@ fn build_recover_project_plan(
     )?))
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn extract_expressions(
     expr: &Expr,
     schema: &DFSchema,

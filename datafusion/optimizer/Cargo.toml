@@ -51,6 +51,7 @@ indexmap = { workspace = true }
 itertools = { workspace = true }
 log = { workspace = true }
 regex-syntax = "0.8.0"
+tracing = "0.1.40"
 [dev-dependencies]
 ctor = { workspace = true }
 datafusion-sql = { workspace = true }

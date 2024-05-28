@@ -77,6 +77,7 @@ fn rewrite_sort_col_by_aggs(expr: Expr, plan: &LogicalPlan) -> Result<Expr> {
 /// Remember that:
 /// 1. given a projection with exprs: [a, b + c]
 /// 2. t produces an output schema with two columns "a", "b + c"
+#[tracing::instrument(level = "debug", skip_all)]
 fn rewrite_in_terms_of_projection(
     expr: Expr,
     proj_exprs: Vec<Expr>,

@@ -752,6 +752,7 @@ fn rewrite_projection_given_requirements(
 /// Projection is unnecessary, when
 /// - input schema of the projection, output schema of the projection are same, and
 /// - all projection expressions are either Column or Literal
+#[tracing::instrument(level = "debug", skip_all)]
 fn is_projection_unnecessary(input: &LogicalPlan, proj_exprs: &[Expr]) -> Result<bool> {
     Ok(&projection_schema(input, proj_exprs)? == input.schema()
         && proj_exprs.iter().all(is_expr_trivial))

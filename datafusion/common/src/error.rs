@@ -618,11 +618,22 @@ pub use plan_err as _plan_err;
 pub use schema_err as _schema_err;
 
 /// Create a "field not found" DataFusion::SchemaError
-pub fn field_not_found<R: Into<TableReference>>(
+pub fn field_not_found<R>(
     qualifier: Option<R>,
     name: &str,
     schema: &DFSchema,
-) -> DataFusionError {
+) -> DataFusionError
+where
+    R: Into<TableReference> + std::fmt::Display,
+{
+    tracing::debug!(
+        "Field not found: {}{}",
+        qualifier
+            .as_ref()
+            .map(|r| format!("{r}."))
+            .unwrap_or_default(),
+        name
+    );
     schema_datafusion_err!(SchemaError::FieldNotFound {
         field: Box::new(Column::new(qualifier, name)),
         valid_fields: schema.columns().to_vec(),

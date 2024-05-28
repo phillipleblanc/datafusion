@@ -32,6 +32,7 @@ use crate::{
 use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use arrow_schema::SchemaBuilder;
+use tracing::instrument;
 
 /// A reference-counted reference to a [DFSchema].
 pub type DFSchemaRef = Arc<DFSchema>;
@@ -375,6 +376,7 @@ impl DFSchema {
     ///
     /// See [Self::maybe_index_of_column] for a version that returns `None` if
     /// the column is not found
+    #[instrument(level = "debug", skip(self))]
     pub fn index_of_column(&self, col: &Column) -> Result<usize> {
         self.maybe_index_of_column(col)
             .ok_or_else(|| field_not_found(col.relation.clone(), &col.name, self))
@@ -400,6 +402,7 @@ impl DFSchema {
     }
 
     /// Find the qualified field with the given name
+    #[instrument(level = "debug", skip(self))]
     pub fn qualified_field_with_name(
         &self,
         qualifier: Option<&TableReference>,
@@ -539,6 +542,7 @@ impl DFSchema {
     }
 
     /// Find the field with the given qualified name
+    #[instrument(level = "debug", skip_all, fields(qualifier = %qualifier, name = %name))]
     pub fn field_with_qualified_name(
         &self,
         qualifier: &TableReference,
@@ -552,6 +556,7 @@ impl DFSchema {
     }
 
     /// Find the field with the given qualified column
+    #[instrument(level = "debug", skip_all)]
     pub fn field_from_column(&self, column: &Column) -> Result<&Field> {
         match &column.relation {
             Some(r) => self.field_with_qualified_name(r, &column.name),
@@ -959,20 +964,24 @@ impl<P: AsRef<DFSchema> + std::fmt::Debug> ExprSchema for P {
         ExprSchema::metadata(self.as_ref(), col)
     }
 
+    #[instrument(level = "debug", skip_all)]
     fn data_type_and_nullable(&self, col: &Column) -> Result<(&DataType, bool)> {
         self.as_ref().data_type_and_nullable(col)
     }
 }
 
 impl ExprSchema for DFSchema {
+    #[instrument(level = "debug", skip_all)]
     fn nullable(&self, col: &Column) -> Result<bool> {
         Ok(self.field_from_column(col)?.is_nullable())
     }
 
+    #[instrument(level = "debug", skip_all)]
     fn data_type(&self, col: &Column) -> Result<&DataType> {
         Ok(self.field_from_column(col)?.data_type())
     }
 
+    #[instrument(level = "debug", skip_all)]
     fn metadata(&self, col: &Column) -> Result<&HashMap<String, String>> {
         Ok(self.field_from_column(col)?.metadata())
     }

@@ -40,6 +40,7 @@ use datafusion_expr::logical_plan::{LogicalPlan, LogicalPlanBuilder};
 use datafusion_expr::utils::find_column_exprs;
 use datafusion_expr::TableSource;
 use datafusion_expr::{col, AggregateUDF, Expr, ScalarUDF};
+use tracing::instrument;
 
 use crate::utils::make_decimal_type;
 
@@ -335,6 +336,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     }
 
     /// Validate the schema provides all of the columns referenced in the expressions.
+    #[instrument(level = "debug", skip(self))]
     pub(crate) fn validate_schema_satisfies_exprs(
         &self,
         schema: &DFSchema,

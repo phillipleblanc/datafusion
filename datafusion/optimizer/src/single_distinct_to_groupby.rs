@@ -104,6 +104,7 @@ fn contains_grouping_set(expr: &[Expr]) -> bool {
 }
 
 impl OptimizerRule for SingleDistinctToGroupBy {
+    #[tracing::instrument(level = "debug", skip_all)]
     fn try_optimize(
         &self,
         plan: &LogicalPlan,

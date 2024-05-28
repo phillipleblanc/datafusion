@@ -38,6 +38,7 @@ impl FunctionRewrite for ArrayFunctionRewriter {
         "FunctionRewrite"
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     fn rewrite(
         &self,
         expr: Expr,

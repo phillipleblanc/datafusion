@@ -362,6 +362,7 @@ impl ExprSchemable for Expr {
     ///
     /// This function errors when it is not possible to compute its
     /// datatype or nullability.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn data_type_and_nullable(
         &self,
         schema: &dyn ExprSchema,
@@ -415,12 +416,15 @@ impl ExprSchemable for Expr {
     ///
     /// So for example, a projected expression `col(c1) + col(c2)` is
     /// placed in an output field **named** col("c1 + c2")
+    #[tracing::instrument(level = "debug", skip_all)]
     fn to_field(
         &self,
         input_schema: &dyn ExprSchema,
     ) -> Result<(Option<TableReference>, Arc<Field>)> {
+        tracing::debug!("to_field: {:?}", self);
         match self {
             Expr::Column(c) => {
+                tracing::debug!("Column: {:?}", c);
                 let (data_type, nullable) = self.data_type_and_nullable(input_schema)?;
                 Ok((
                     c.relation.clone(),
@@ -430,6 +434,7 @@ impl ExprSchemable for Expr {
                 ))
             }
             Expr::Alias(Alias { relation, name, .. }) => {
+                tracing::debug!("Alias: {:?}", name);
                 let (data_type, nullable) = self.data_type_and_nullable(input_schema)?;
                 Ok((
                     relation.clone(),
@@ -439,6 +444,7 @@ impl ExprSchemable for Expr {
                 ))
             }
             _ => {
+                tracing::debug!("Other: {:?}", self);
                 let (data_type, nullable) = self.data_type_and_nullable(input_schema)?;
                 Ok((
                     None,

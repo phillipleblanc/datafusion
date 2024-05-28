@@ -734,6 +734,7 @@ fn agg_cols(agg: &Aggregate) -> Vec<Column> {
         .collect()
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn exprlist_to_fields_aggregate(
     exprs: &[Expr],
     agg: &Aggregate,
@@ -753,6 +754,7 @@ fn exprlist_to_fields_aggregate(
 }
 
 /// Create field meta-data from an expression, for use in a result set schema
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn exprlist_to_fields(
     exprs: &[Expr],
     plan: &LogicalPlan,
@@ -770,6 +772,7 @@ pub fn exprlist_to_fields(
     } else {
         // look for exact match in plan's output schema
         let input_schema = &plan.schema();
+        tracing::debug!("input_schema: {:?}", input_schema);
         exprs.iter().map(|e| e.to_field(input_schema)).collect()
     }
 }

@@ -492,6 +492,7 @@ impl LogicalPlan {
     /// // create new plan using rewritten_exprs in same position
     /// let new_plan = plan.new_with_exprs(rewritten_exprs, new_inputs);
     /// ```
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn with_new_exprs(
         &self,
         mut expr: Vec<Expr>,
@@ -1635,7 +1636,10 @@ pub struct Projection {
 
 impl Projection {
     /// Create a new Projection
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn try_new(expr: Vec<Expr>, input: Arc<LogicalPlan>) -> Result<Self> {
+        tracing::debug!("input schema: {:?}", input.schema());
+        tracing::debug!("expr: {:?}", expr);
         let projection_schema = projection_schema(&input, &expr)?;
         Self::try_new_with_schema(expr, input, projection_schema)
     }
@@ -1680,6 +1684,7 @@ impl Projection {
 /// A `Result` containing an `Arc<DFSchema>` representing the schema of the result
 /// produced by the projection operation. If the schema computation is successful,
 /// the `Result` will contain the schema; otherwise, it will contain an error.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn projection_schema(input: &LogicalPlan, exprs: &[Expr]) -> Result<Arc<DFSchema>> {
     let mut schema = DFSchema::new_with_metadata(
         exprlist_to_fields(exprs, input)?,
@@ -1857,6 +1862,7 @@ pub struct Window {
 
 impl Window {
     /// Create a new window operator.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn try_new(window_expr: Vec<Expr>, input: Arc<LogicalPlan>) -> Result<Self> {
         let fields: Vec<(Option<TableReference>, Arc<Field>)> = input
             .schema()
@@ -2177,6 +2183,7 @@ pub struct DistinctOn {
 
 impl DistinctOn {
     /// Create a new `DistinctOn` struct.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn try_new(
         on_expr: Vec<Expr>,
         select_expr: Vec<Expr>,
@@ -2261,6 +2268,7 @@ pub struct Aggregate {
 
 impl Aggregate {
     /// Create a new aggregate operator.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn try_new(
         input: Arc<LogicalPlan>,
         group_expr: Vec<Expr>,

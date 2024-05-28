@@ -517,6 +517,7 @@ impl LogicalPlanBuilder {
     }
 
     /// Apply a sort
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn sort(
         self,
         exprs: impl IntoIterator<Item = impl Into<Expr>> + Clone,
@@ -825,6 +826,7 @@ impl LogicalPlanBuilder {
     }
 
     /// Apply a join with using constraint, which duplicates all join columns in output schema.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn join_using(
         self,
         right: LogicalPlan,
@@ -1292,6 +1294,7 @@ pub(crate) fn validate_unique_names<'a>(
     })
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn project_with_column_index(
     expr: Vec<Expr>,
     input: Arc<LogicalPlan>,
