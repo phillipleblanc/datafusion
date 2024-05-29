@@ -16,7 +16,9 @@
 // under the License.
 
 use datafusion_common::{internal_err, not_impl_err, plan_err, DataFusionError, Result};
-use datafusion_expr::{expr::Alias, Expr, JoinConstraint, JoinType, LogicalPlan};
+use datafusion_expr::{
+    expr::Alias, Distinct, Expr, JoinConstraint, JoinType, LogicalPlan,
+};
 use sqlparser::ast::{self, SetExpr};
 
 use crate::unparser::utils::unproject_agg_exprs;
@@ -52,7 +54,7 @@ use super::{
 ///     .unwrap();
 /// let sql = plan_to_sql(&plan).unwrap();
 ///
-/// assert_eq!(format!("{}", sql), "SELECT \"table\".\"id\", \"table\".\"value\" FROM \"table\"")
+/// assert_eq!(format!("{}", sql), "SELECT \"table\".id, \"table\".\"value\" FROM \"table\"")
 /// ```
 pub fn plan_to_sql(plan: &LogicalPlan) -> Result<ast::Statement> {
     let unparser = Unparser::default();
@@ -141,12 +143,16 @@ impl Unparser<'_> {
                 let mut builder = TableRelationBuilder::default();
                 let mut table_parts = vec![];
                 if let Some(catalog_name) = scan.table_name.catalog() {
-                    table_parts.push(self.new_ident(catalog_name.to_string()));
+                    table_parts
+                        .push(self.new_ident_quoted_if_needs(catalog_name.to_string()));
                 }
                 if let Some(schema_name) = scan.table_name.schema() {
-                    table_parts.push(self.new_ident(schema_name.to_string()));
+                    table_parts
+                        .push(self.new_ident_quoted_if_needs(schema_name.to_string()));
                 }
-                table_parts.push(self.new_ident(scan.table_name.table().to_string()));
+                table_parts.push(
+                    self.new_ident_quoted_if_needs(scan.table_name.table().to_string()),
+                );
                 builder.name(ast::ObjectName(table_parts));
                 relation.table(builder);
 
@@ -267,8 +273,39 @@ impl Unparser<'_> {
                     relation,
                 )
             }
-            LogicalPlan::Distinct(_distinct) => {
-                not_impl_err!("Unsupported operator: {plan:?}")
+            LogicalPlan::Distinct(distinct) => {
+                let (select_distinct, input) = match distinct {
+                    Distinct::All(input) => (ast::Distinct::Distinct, input.as_ref()),
+                    Distinct::On(on) => {
+                        let exprs = on
+                            .on_expr
+                            .iter()
+                            .map(|e| self.expr_to_sql(e))
+                            .collect::<Result<Vec<_>>>()?;
+                        let items = on
+                            .select_expr
+                            .iter()
+                            .map(|e| self.select_item_to_sql(e))
+                            .collect::<Result<Vec<_>>>()?;
+                        match &on.sort_expr {
+                            Some(sort_expr) => {
+                                if let Some(query_ref) = query {
+                                    query_ref
+                                        .order_by(self.sort_to_sql(sort_expr.clone())?);
+                                } else {
+                                    return internal_err!(
+                                "Sort operator only valid in a statement context."
+                            );
+                                }
+                            }
+                            None => {}
+                        }
+                        select.projection(items);
+                        (ast::Distinct::On(exprs), on.input.as_ref())
+                    }
+                };
+                select.distinct(Some(select_distinct));
+                self.select_to_sql_recursively(input, query, select, relation)
             }
             LogicalPlan::Join(join) => {
                 match join.join_constraint {
@@ -419,7 +456,7 @@ impl Unparser<'_> {
 
                 Ok(ast::SelectItem::ExprWithAlias {
                     expr: inner,
-                    alias: self.new_ident(name.to_string()),
+                    alias: self.new_ident_quoted_if_needs(name.to_string()),
                 })
             }
             _ => {
@@ -436,10 +473,17 @@ impl Unparser<'_> {
             .map(|expr: &Expr| match expr {
                 Expr::Sort(sort_expr) => {
                     let col = self.expr_to_sql(&sort_expr.expr)?;
+
+                    let nulls_first = if self.dialect.supports_nulls_first_in_sort() {
+                        Some(sort_expr.nulls_first)
+                    } else {
+                        None
+                    };
+
                     Ok(ast::OrderByExpr {
                         asc: Some(sort_expr.asc),
                         expr: col,
-                        nulls_first: Some(sort_expr.nulls_first),
+                        nulls_first,
                     })
                 }
                 _ => plan_err!("Expecting Sort expr"),
@@ -490,7 +534,7 @@ impl Unparser<'_> {
 
     fn new_table_alias(&self, alias: String) -> ast::TableAlias {
         ast::TableAlias {
-            name: self.new_ident(alias),
+            name: self.new_ident_quoted_if_needs(alias),
             columns: Vec::new(),
         }
     }

@@ -22,8 +22,6 @@ use arrow::datatypes::DataType;
 use arrow::row::{RowConverter, SortField};
 use datafusion_common::cast::as_generic_list_array;
 use datafusion_common::{exec_err, Result};
-use datafusion_expr::expr::ScalarFunction;
-use datafusion_expr::Expr;
 use datafusion_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility};
 
 use itertools::Itertools;
@@ -34,19 +32,19 @@ use std::any::Any;
 use std::sync::Arc;
 
 // Create static instances of ScalarUDFs for each function
-make_udf_function!(ArrayHas,
+make_udf_expr_and_func!(ArrayHas,
     array_has,
     first_array second_array, // arg name
     "returns true, if the element appears in the first array, otherwise false.", // doc
     array_has_udf // internal function name
 );
-make_udf_function!(ArrayHasAll,
+make_udf_expr_and_func!(ArrayHasAll,
     array_has_all,
     first_array second_array, // arg name
     "returns true if each element of the second array appears in the first array; otherwise, it returns false.", // doc
     array_has_all_udf // internal function name
 );
-make_udf_function!(ArrayHasAny,
+make_udf_expr_and_func!(ArrayHasAny,
     array_has_any,
     first_array second_array, // arg name
     "returns true if at least one element of the second array appears in the first array; otherwise, it returns false.", // doc
@@ -70,7 +68,6 @@ impl ArrayHas {
         Self {
             signature: Signature::array_and_element(Volatility::Immutable),
             aliases: vec![
-                String::from("array_has"),
                 String::from("list_has"),
                 String::from("array_contains"),
                 String::from("list_contains"),
@@ -142,7 +139,7 @@ impl ArrayHasAll {
     pub fn new() -> Self {
         Self {
             signature: Signature::any(2, Volatility::Immutable),
-            aliases: vec![String::from("array_has_all"), String::from("list_has_all")],
+            aliases: vec![String::from("list_has_all")],
         }
     }
 }
@@ -205,7 +202,7 @@ impl ArrayHasAny {
     pub fn new() -> Self {
         Self {
             signature: Signature::any(2, Volatility::Immutable),
-            aliases: vec![String::from("array_has_any"), String::from("list_has_any")],
+            aliases: vec![String::from("list_has_any")],
         }
     }
 }

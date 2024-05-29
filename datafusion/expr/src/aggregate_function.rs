@@ -43,16 +43,10 @@ pub enum AggregateFunction {
     Max,
     /// Average
     Avg,
-    /// Median
-    Median,
     /// Approximate distinct function
     ApproxDistinct,
     /// Aggregation into an array
     ArrayAgg,
-    /// First value in a group according to some ordering
-    FirstValue,
-    /// Last value in a group according to some ordering
-    LastValue,
     /// N'th value in a group according to some ordering
     NthValue,
     /// Variance (Sample)
@@ -63,8 +57,6 @@ pub enum AggregateFunction {
     Stddev,
     /// Standard Deviation (Population)
     StddevPop,
-    /// Covariance (Population)
-    CovariancePop,
     /// Correlation
     Correlation,
     /// Slope from linear regression
@@ -116,17 +108,13 @@ impl AggregateFunction {
             Min => "MIN",
             Max => "MAX",
             Avg => "AVG",
-            Median => "MEDIAN",
             ApproxDistinct => "APPROX_DISTINCT",
             ArrayAgg => "ARRAY_AGG",
-            FirstValue => "FIRST_VALUE",
-            LastValue => "LAST_VALUE",
             NthValue => "NTH_VALUE",
             Variance => "VAR",
             VariancePop => "VAR_POP",
             Stddev => "STDDEV",
             StddevPop => "STDDEV_POP",
-            CovariancePop => "COVAR_POP",
             Correlation => "CORR",
             RegrSlope => "REGR_SLOPE",
             RegrIntercept => "REGR_INTERCEPT",
@@ -171,17 +159,13 @@ impl FromStr for AggregateFunction {
             "count" => AggregateFunction::Count,
             "max" => AggregateFunction::Max,
             "mean" => AggregateFunction::Avg,
-            "median" => AggregateFunction::Median,
             "min" => AggregateFunction::Min,
             "sum" => AggregateFunction::Sum,
             "array_agg" => AggregateFunction::ArrayAgg,
-            "first_value" => AggregateFunction::FirstValue,
-            "last_value" => AggregateFunction::LastValue,
             "nth_value" => AggregateFunction::NthValue,
             "string_agg" => AggregateFunction::StringAgg,
             // statistical
             "corr" => AggregateFunction::Correlation,
-            "covar_pop" => AggregateFunction::CovariancePop,
             "stddev" => AggregateFunction::Stddev,
             "stddev_pop" => AggregateFunction::StddevPop,
             "stddev_samp" => AggregateFunction::Stddev,
@@ -255,9 +239,6 @@ impl AggregateFunction {
             AggregateFunction::VariancePop => {
                 variance_return_type(&coerced_data_types[0])
             }
-            AggregateFunction::CovariancePop => {
-                covariance_return_type(&coerced_data_types[0])
-            }
             AggregateFunction::Correlation => {
                 correlation_return_type(&coerced_data_types[0])
             }
@@ -282,13 +263,9 @@ impl AggregateFunction {
             AggregateFunction::ApproxPercentileContWithWeight => {
                 Ok(coerced_data_types[0].clone())
             }
-            AggregateFunction::ApproxMedian | AggregateFunction::Median => {
-                Ok(coerced_data_types[0].clone())
-            }
+            AggregateFunction::ApproxMedian => Ok(coerced_data_types[0].clone()),
             AggregateFunction::Grouping => Ok(DataType::Int32),
-            AggregateFunction::FirstValue
-            | AggregateFunction::LastValue
-            | AggregateFunction::NthValue => Ok(coerced_data_types[0].clone()),
+            AggregateFunction::NthValue => Ok(coerced_data_types[0].clone()),
             AggregateFunction::StringAgg => Ok(DataType::LargeUtf8),
         }
     }
@@ -342,15 +319,11 @@ impl AggregateFunction {
             | AggregateFunction::VariancePop
             | AggregateFunction::Stddev
             | AggregateFunction::StddevPop
-            | AggregateFunction::Median
-            | AggregateFunction::ApproxMedian
-            | AggregateFunction::FirstValue
-            | AggregateFunction::LastValue => {
+            | AggregateFunction::ApproxMedian => {
                 Signature::uniform(1, NUMERICS.to_vec(), Volatility::Immutable)
             }
             AggregateFunction::NthValue => Signature::any(2, Volatility::Immutable),
-            AggregateFunction::CovariancePop
-            | AggregateFunction::Correlation
+            AggregateFunction::Correlation
             | AggregateFunction::RegrSlope
             | AggregateFunction::RegrIntercept
             | AggregateFunction::RegrCount

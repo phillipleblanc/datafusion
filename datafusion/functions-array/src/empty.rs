@@ -23,12 +23,11 @@ use arrow_schema::DataType;
 use arrow_schema::DataType::{Boolean, FixedSizeList, LargeList, List};
 use datafusion_common::cast::{as_generic_list_array, as_null_array};
 use datafusion_common::{exec_err, plan_err, Result};
-use datafusion_expr::expr::ScalarFunction;
-use datafusion_expr::{ColumnarValue, Expr, ScalarUDFImpl, Signature, Volatility};
+use datafusion_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility};
 use std::any::Any;
 use std::sync::Arc;
 
-make_udf_function!(
+make_udf_expr_and_func!(
     ArrayEmpty,
     array_empty,
     array,
@@ -45,11 +44,7 @@ impl ArrayEmpty {
     pub fn new() -> Self {
         Self {
             signature: Signature::array(Volatility::Immutable),
-            aliases: vec![
-                "empty".to_string(),
-                "array_empty".to_string(),
-                "list_empty".to_string(),
-            ],
+            aliases: vec!["array_empty".to_string(), "list_empty".to_string()],
         }
     }
 }

@@ -23,6 +23,8 @@ use std::ops::ControlFlow;
 use std::sync::{Arc, Weak};
 
 use super::options::ReadOptions;
+#[cfg(feature = "array_expressions")]
+use crate::functions_array;
 use crate::{
     catalog::information_schema::{InformationSchemaProvider, INFORMATION_SCHEMA},
     catalog::listing_schema::ListingSchemaProvider,
@@ -53,14 +55,12 @@ use crate::{
     },
     optimizer::analyzer::{Analyzer, AnalyzerRule},
     optimizer::optimizer::{Optimizer, OptimizerConfig, OptimizerRule},
+    physical_expr::{create_physical_expr, PhysicalExpr},
     physical_optimizer::optimizer::{PhysicalOptimizer, PhysicalOptimizerRule},
     physical_plan::ExecutionPlan,
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
     variable::{VarProvider, VarType},
 };
-
-#[cfg(feature = "array_expressions")]
-use crate::functions_array;
 use crate::{functions, functions_aggregate};
 
 use arrow::datatypes::{DataType, SchemaRef};
@@ -70,37 +70,35 @@ use datafusion_common::{
     alias::AliasGenerator,
     config::{ConfigExtension, TableOptions},
     exec_err, not_impl_err, plan_datafusion_err, plan_err,
-    tree_node::{TreeNodeRecursion, TreeNodeVisitor},
+    tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor},
     DFSchema, SchemaReference, TableReference,
 };
 use datafusion_execution::registry::SerializerRegistry;
 use datafusion_expr::{
+    expr_rewriter::FunctionRewrite,
     logical_plan::{DdlStatement, Statement},
+    simplify::SimplifyInfo,
     var_provider::is_system_variables,
     Expr, ExprSchemable, StringifiedPlan, UserDefinedLogicalNode, WindowUDF,
 };
+use datafusion_optimizer::simplify_expressions::ExprSimplifier;
 use datafusion_sql::{
     parser::{CopyToSource, CopyToStatement, DFParser},
     planner::{object_name_to_table_reference, ContextProvider, ParserOptions, SqlToRel},
     ResolvedTableReference,
 };
+use sqlparser::dialect::dialect_from_str;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use datafusion_common::tree_node::TreeNode;
+use object_store::ObjectStore;
 use parking_lot::RwLock;
-use sqlparser::dialect::dialect_from_str;
 use url::Url;
 use uuid::Uuid;
 
-use crate::physical_expr::PhysicalExpr;
 pub use datafusion_execution::config::SessionConfig;
 pub use datafusion_execution::TaskContext;
 pub use datafusion_expr::execution_props::ExecutionProps;
-use datafusion_expr::expr_rewriter::FunctionRewrite;
-use datafusion_expr::simplify::SimplifyInfo;
-use datafusion_optimizer::simplify_expressions::ExprSimplifier;
-use datafusion_physical_expr::create_physical_expr;
 
 mod avro;
 mod csv;
@@ -355,6 +353,29 @@ impl SessionContext {
     ) -> Self {
         self.state.write().set_function_factory(function_factory);
         self
+    }
+
+    /// Registers an [`ObjectStore`] to be used with a specific URL prefix.
+    ///
+    /// See [`RuntimeEnv::register_object_store`] for more details.
+    ///
+    /// # Example: register a local object store for the "file://" URL prefix
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use datafusion::prelude::SessionContext;
+    /// # use datafusion_execution::object_store::ObjectStoreUrl;
+    /// let object_store_url = ObjectStoreUrl::parse("file://").unwrap();
+    /// let object_store = object_store::local::LocalFileSystem::new();
+    /// let mut ctx = SessionContext::new();
+    /// // All files with the file:// url prefix will be read from the local file system
+    /// ctx.register_object_store(object_store_url.as_ref(), Arc::new(object_store));
+    /// ```
+    pub fn register_object_store(
+        &self,
+        url: &Url,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Option<Arc<dyn ObjectStore>> {
+        self.runtime_env().register_object_store(url, object_store)
     }
 
     /// Registers the [`RecordBatch`] as the specified table name
@@ -1560,7 +1581,6 @@ impl SessionState {
         let url = url.to_string();
         let format = format.to_string();
 
-        let has_header = config.options().catalog.has_header;
         let url = Url::parse(url.as_str()).expect("Invalid default catalog location!");
         let authority = match url.host_str() {
             Some(host) => format!("{}://{}", url.scheme(), host),
@@ -1578,14 +1598,8 @@ impl SessionState {
             Some(factory) => factory,
             _ => return,
         };
-        let schema = ListingSchemaProvider::new(
-            authority,
-            path,
-            factory.clone(),
-            store,
-            format,
-            has_header,
-        );
+        let schema =
+            ListingSchemaProvider::new(authority, path, factory.clone(), store, format);
         let _ = default_catalog
             .register_schema("default", Arc::new(schema))
             .expect("Failed to register default schema");
@@ -2219,15 +2233,15 @@ impl<'a> ContextProvider for SessionContextProvider<'a> {
         self.state.config_options()
     }
 
-    fn udfs_names(&self) -> Vec<String> {
+    fn udf_names(&self) -> Vec<String> {
         self.state.scalar_functions().keys().cloned().collect()
     }
 
-    fn udafs_names(&self) -> Vec<String> {
+    fn udaf_names(&self) -> Vec<String> {
         self.state.aggregate_functions().keys().cloned().collect()
     }
 
-    fn udwfs_names(&self) -> Vec<String> {
+    fn udwf_names(&self) -> Vec<String> {
         self.state.window_functions().keys().cloned().collect()
     }
 }
@@ -2451,10 +2465,10 @@ impl<'a> BadPlanVisitor<'a> {
     }
 }
 
-impl<'a> TreeNodeVisitor for BadPlanVisitor<'a> {
+impl<'n, 'a> TreeNodeVisitor<'n> for BadPlanVisitor<'a> {
     type Node = LogicalPlan;
 
-    fn f_down(&mut self, node: &Self::Node) -> Result<TreeNodeRecursion> {
+    fn f_down(&mut self, node: &'n Self::Node) -> Result<TreeNodeRecursion> {
         match node {
             LogicalPlan::Ddl(ddl) if !self.options.allow_ddl => {
                 plan_err!("DDL not supported: {}", ddl.name())

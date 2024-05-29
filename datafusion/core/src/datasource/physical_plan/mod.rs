@@ -61,13 +61,7 @@ use crate::{
     physical_plan::display::{display_orderings, ProjectSchemaDisplay},
 };
 
-use arrow::{
-    array::new_null_array,
-    compute::{can_cast_types, cast},
-    datatypes::{DataType, Schema, SchemaRef},
-    record_batch::{RecordBatch, RecordBatchOptions},
-};
-use datafusion_common::plan_err;
+use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::PhysicalSortExpr;
 
@@ -239,125 +233,6 @@ where
         format_element(element, f)?;
     }
     Ok(())
-}
-
-/// A utility which can adapt file-level record batches to a table schema which may have a schema
-/// obtained from merging multiple file-level schemas.
-///
-/// This is useful for enabling schema evolution in partitioned datasets.
-///
-/// This has to be done in two stages.
-///
-/// 1. Before reading the file, we have to map projected column indexes from the table schema to
-///    the file schema.
-///
-/// 2. After reading a record batch we need to map the read columns back to the expected columns
-///    indexes and insert null-valued columns wherever the file schema was missing a colum present
-///    in the table schema.
-#[derive(Clone, Debug)]
-pub(crate) struct SchemaAdapter {
-    /// Schema for the table
-    table_schema: SchemaRef,
-}
-
-impl SchemaAdapter {
-    pub(crate) fn new(table_schema: SchemaRef) -> SchemaAdapter {
-        Self { table_schema }
-    }
-
-    /// Map a column index in the table schema to a column index in a particular
-    /// file schema
-    ///
-    /// Panics if index is not in range for the table schema
-    pub(crate) fn map_column_index(
-        &self,
-        index: usize,
-        file_schema: &Schema,
-    ) -> Option<usize> {
-        let field = self.table_schema.field(index);
-        Some(file_schema.fields.find(field.name())?.0)
-    }
-
-    /// Creates a `SchemaMapping` that can be used to cast or map the columns from the file schema to the table schema.
-    ///
-    /// If the provided `file_schema` contains columns of a different type to the expected
-    /// `table_schema`, the method will attempt to cast the array data from the file schema
-    /// to the table schema where possible.
-    ///
-    /// Returns a [`SchemaMapping`] that can be applied to the output batch
-    /// along with an ordered list of columns to project from the file
-    pub fn map_schema(
-        &self,
-        file_schema: &Schema,
-    ) -> Result<(SchemaMapping, Vec<usize>)> {
-        let mut projection = Vec::with_capacity(file_schema.fields().len());
-        let mut field_mappings = vec![None; self.table_schema.fields().len()];
-
-        for (file_idx, file_field) in file_schema.fields.iter().enumerate() {
-            if let Some((table_idx, table_field)) =
-                self.table_schema.fields().find(file_field.name())
-            {
-                match can_cast_types(file_field.data_type(), table_field.data_type()) {
-                    true => {
-                        field_mappings[table_idx] = Some(projection.len());
-                        projection.push(file_idx);
-                    }
-                    false => {
-                        return plan_err!(
-                            "Cannot cast file schema field {} of type {:?} to table schema field of type {:?}",
-                            file_field.name(),
-                            file_field.data_type(),
-                            table_field.data_type()
-                        )
-                    }
-                }
-            }
-        }
-
-        Ok((
-            SchemaMapping {
-                table_schema: self.table_schema.clone(),
-                field_mappings,
-            },
-            projection,
-        ))
-    }
-}
-
-/// The SchemaMapping struct holds a mapping from the file schema to the table schema
-/// and any necessary type conversions that need to be applied.
-#[derive(Debug)]
-pub struct SchemaMapping {
-    /// The schema of the table. This is the expected schema after conversion and it should match the schema of the query result.
-    table_schema: SchemaRef,
-    /// Mapping from field index in `table_schema` to index in projected file_schema
-    field_mappings: Vec<Option<usize>>,
-}
-
-impl SchemaMapping {
-    /// Adapts a `RecordBatch` to match the `table_schema` using the stored mapping and conversions.
-    fn map_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        let batch_rows = batch.num_rows();
-        let batch_cols = batch.columns().to_vec();
-
-        let cols = self
-            .table_schema
-            .fields()
-            .iter()
-            .zip(&self.field_mappings)
-            .map(|(field, file_idx)| match file_idx {
-                Some(batch_idx) => cast(&batch_cols[*batch_idx], field.data_type()),
-                None => Ok(new_null_array(field.data_type(), batch_rows)),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Necessary to handle empty batches
-        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-
-        let schema = self.table_schema.clone();
-        let record_batch = RecordBatch::try_new_with_options(schema, cols, &options)?;
-        Ok(record_batch)
-    }
 }
 
 /// A single file or part of a file that should be read, along with its schema, statistics
@@ -621,11 +496,14 @@ mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Float32Type, Float64Type, UInt32Type};
     use arrow_array::{
-        BinaryArray, BooleanArray, Float32Array, Int32Array, Int64Array, StringArray,
-        UInt64Array,
+        BinaryArray, BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch,
+        StringArray, UInt64Array,
     };
-    use arrow_schema::Field;
+    use arrow_schema::{Field, Schema};
 
+    use crate::datasource::schema_adapter::{
+        DefaultSchemaAdapterFactory, SchemaAdapterFactory,
+    };
     use chrono::Utc;
 
     #[test]
@@ -636,7 +514,7 @@ mod tests {
             Field::new("c3", DataType::Float64, true),
         ]));
 
-        let adapter = SchemaAdapter::new(table_schema.clone());
+        let adapter = DefaultSchemaAdapterFactory::default().create(table_schema.clone());
 
         let file_schema = Schema::new(vec![
             Field::new("c1", DataType::Utf8, true),
@@ -693,7 +571,7 @@ mod tests {
 
         let indices = vec![1, 2, 4];
         let schema = SchemaRef::from(table_schema.project(&indices).unwrap());
-        let adapter = SchemaAdapter::new(schema);
+        let adapter = DefaultSchemaAdapterFactory::default().create(schema);
         let (mapping, projection) = adapter.map_schema(&file_schema).unwrap();
 
         let id = Int32Array::from(vec![Some(1), Some(2), Some(3)]);
