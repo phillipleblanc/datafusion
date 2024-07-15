@@ -337,7 +337,7 @@ impl SessionState {
     pub fn add_analyzer_rule(
         &mut self,
         analyzer_rule: Arc<dyn AnalyzerRule + Send + Sync>,
-    ) -> &Self {
+    ) -> &mut Self {
         self.analyzer.rules.push(analyzer_rule);
         self
     }
