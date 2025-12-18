@@ -44,9 +44,7 @@ use datafusion_expr::type_coercion::binary::{comparison_coercion, like_coercion}
 use datafusion_expr::type_coercion::functions::{
     data_types_with_scalar_udf, fields_with_aggregate_udf,
 };
-use datafusion_expr::type_coercion::other::{
-    get_coerce_type_for_case_expression, get_coerce_type_for_list,
-};
+use datafusion_expr::type_coercion::other::{get_coerce_type_for_case_expression, get_coerce_type_for_list, get_coerce_types_for_case_expression};
 use datafusion_expr::type_coercion::{is_datetime, is_utf8_or_utf8view_or_large_utf8};
 use datafusion_expr::utils::merge_schema;
 use datafusion_expr::{
@@ -869,61 +867,9 @@ fn coerce_case_expression(case: Case, schema: &DFSchema) -> Result<Case> {
     // Note that case-when and when-boolean expression coercions are mutually exclusive
     // Only one or the other can occur for a case expression, whilst then-else expression coercion will always occur
 
-    // prepare types
-    let case_type = case
-        .expr
-        .as_ref()
-        .map(|expr| expr.get_type(schema))
-        .transpose()?;
-    let then_types = case
-        .when_then_expr
-        .iter()
-        .map(|(_when, then)| then.get_type(schema))
-        .collect::<Result<Vec<_>>>()?;
-    let else_type = case
-        .else_expr
-        .as_ref()
-        .map(|expr| expr.get_type(schema))
-        .transpose()?;
-
-    // find common coercible types
-    let case_when_coerce_type = case_type
-        .as_ref()
-        .map(|case_type| {
-            let when_types = case
-                .when_then_expr
-                .iter()
-                .map(|(when, _then)| when.get_type(schema))
-                .collect::<Result<Vec<_>>>()?;
-            let coerced_type =
-                get_coerce_type_for_case_expression(&when_types, Some(case_type));
-            coerced_type.ok_or_else(|| {
-                plan_datafusion_err!(
-                    "Failed to coerce case ({case_type}) and when ({}) \
-                     to common types in CASE WHEN expression",
-                    when_types.iter().join(", ")
-                )
-            })
-        })
-        .transpose()?;
-    let then_else_coerce_type =
-        get_coerce_type_for_case_expression(&then_types, else_type.as_ref()).ok_or_else(
-            || {
-                if let Some(else_type) = else_type {
-                    plan_datafusion_err!(
-                        "Failed to coerce then ({}) and else ({else_type}) \
-                         to common types in CASE WHEN expression",
-                        then_types.iter().join(", ")
-                    )
-                } else {
-                    plan_datafusion_err!(
-                        "Failed to coerce then ({}) and else (None) \
-                         to common types in CASE WHEN expression",
-                        then_types.iter().join(", ")
-                    )
-                }
-            },
-        )?;
+    let (case_when_coerce_type, then_else_coerce_type) = get_coerce_types_for_case_expression(&case, schema)?;
+    let case_when_coerce_type = case_when_coerce_type?;
+    let then_else_coerce_type = then_else_coerce_type?;
 
     // do cast if found common coercible types
     let case_expr = case

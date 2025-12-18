@@ -27,7 +27,7 @@ use std::sync::Arc;
 use crate::expr_fn::binary_expr;
 use crate::function::WindowFunctionSimplification;
 use crate::logical_plan::Subquery;
-use crate::type_coercion::other::get_coerce_type_for_case_expression;
+use crate::type_coercion::other::get_coerce_types_for_case_expression;
 use crate::{AggregateUDF, Volatility};
 use crate::{ExprSchemable, Operator, Signature, WindowFrame, WindowUDF};
 
@@ -2025,79 +2025,22 @@ impl Expr {
                 | Expr::SimilarTo(Like { expr, pattern, .. }) => {
                     rewrite_placeholder(pattern.as_mut(), expr.as_ref(), schema)?;
                 }
-                Expr::Case(Case {
-                    expr,
-                    when_then_expr,
-                    else_expr,
-                }) => {
+                Expr::Case(c) => {
+                    let (case_when_target_type, then_else_target_type) =
+                        get_coerce_types_for_case_expression(c, schema)?;
+                    let case_when_target_type = case_when_target_type.unwrap_or(None);
+                    let then_else_target_type =
+                        then_else_target_type.map(|t| Some(t)).unwrap_or(None);
+
                     // If `expr` is present, then it must match the types of each WHEN expression.
                     // If `expr` is not present, then the type of each WHEN expression must evaluate to a boolean.
                     // The types of the THEN and ELSE expressions must match the result type of the CASE expression.
 
-                    fn concrete_type(expr: &Expr, schema: &DFSchema) -> Option<DataType> {
-                        // Untyped placeholders (`$1`, `$2`, ...) don't contribute to inferring a
-                        // common type (they are what we are trying to infer).
-                        if matches!(
-                            expr,
-                            Expr::Placeholder(Placeholder { field: None, .. })
-                        ) {
-                            return None;
-                        }
-
-                        // Treat NULL (and unknown / erroring types) as "no concrete type".
-                        let data_type = expr.get_type(schema).ok()?;
-                        if data_type.is_null() {
-                            None
-                        } else {
-                            Some(data_type)
-                        }
-                    }
-
-                    // Determine a common type for the CASE base expression (if any) and WHEN
-                    // expressions.
-                    let when_types = when_then_expr
-                        .iter()
-                        .filter_map(|(when_expr, _)| {
-                            concrete_type(when_expr.as_ref(), schema)
-                        })
-                        .collect::<Vec<_>>();
-                    let case_type = expr
-                        .as_ref()
-                        .and_then(|e| concrete_type(e.as_ref(), schema));
-
-                    let case_when_target_type = match (case_type, when_types.is_empty()) {
-                        (Some(case_type), true) => Some(case_type),
-                        (Some(case_type), false) => get_coerce_type_for_case_expression(
-                            &when_types,
-                            Some(&case_type),
-                        ),
-                        (None, false) => {
-                            get_coerce_type_for_case_expression(&when_types, None)
-                        }
-                        (None, true) => None,
-                    };
-
-                    // Determine a common type for THEN / ELSE expressions.
-                    let then_else_target_type = {
-                        let mut result_types = when_then_expr
-                            .iter()
-                            .filter_map(|(_, then_expr)| {
-                                concrete_type(then_expr.as_ref(), schema)
-                            })
-                            .collect::<Vec<_>>();
-                        if let Some(t) = else_expr
-                            .as_ref()
-                            .and_then(|e| concrete_type(e.as_ref(), schema))
-                        {
-                            result_types.push(t);
-                        }
-
-                        if result_types.is_empty() {
-                            None
-                        } else {
-                            get_coerce_type_for_case_expression(&result_types, None)
-                        }
-                    };
+                    let Case {
+                        expr,
+                        when_then_expr,
+                        else_expr,
+                    } = c;
 
                     // Rewrite base expression placeholder if present
                     if let Some(e) = expr
