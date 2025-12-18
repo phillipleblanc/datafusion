@@ -16,19 +16,33 @@
 // under the License.
 
 use std::any::Any;
-use std::iter;
 use std::sync::Arc;
 
 use arrow::array::Float64Array;
 use arrow::datatypes::DataType;
 use arrow::datatypes::DataType::Float64;
-use rand::{thread_rng, Rng};
+use rand::{Rng, rng};
 
-use datafusion_common::{exec_err, Result};
-use datafusion_expr::ColumnarValue;
-use datafusion_expr::{ScalarUDFImpl, Signature, Volatility};
+use datafusion_common::{Result, assert_or_internal_err};
+use datafusion_expr::{ColumnarValue, ScalarFunctionArgs};
+use datafusion_expr::{Documentation, ScalarUDFImpl, Signature, Volatility};
+use datafusion_macros::user_doc;
 
-#[derive(Debug)]
+#[user_doc(
+    doc_section(label = "Math Functions"),
+    description = r#"Returns a random float value in the range [0, 1).
+The random seed is unique to each row."#,
+    syntax_example = "random()",
+    sql_example = r#"```sql
+> SELECT random();
++------------------+
+| random()         |
++------------------+
+| 0.7389238902938  |
++------------------+
+```"#
+)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct RandomFunc {
     signature: Signature,
 }
@@ -42,7 +56,7 @@ impl Default for RandomFunc {
 impl RandomFunc {
     pub fn new() -> Self {
         Self {
-            signature: Signature::exact(vec![], Volatility::Volatile),
+            signature: Signature::nullary(Volatility::Volatile),
         }
     }
 }
@@ -64,45 +78,22 @@ impl ScalarUDFImpl for RandomFunc {
         Ok(Float64)
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
-        random(args)
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        assert_or_internal_err!(
+            args.args.is_empty(),
+            "{} function does not accept arguments",
+            self.name()
+        );
+        let mut rng = rng();
+        let mut values = vec![0.0; args.number_rows];
+        // Equivalent to set each element with rng.random_range(0.0..1.0), but more efficient
+        rng.fill(&mut values[..]);
+        let array = Float64Array::from(values);
+
+        Ok(ColumnarValue::Array(Arc::new(array)))
     }
-}
 
-/// Random SQL function
-fn random(args: &[ColumnarValue]) -> Result<ColumnarValue> {
-    let len: usize = match &args[0] {
-        ColumnarValue::Array(array) => array.len(),
-        _ => return exec_err!("Expect random function to take no param"),
-    };
-    let mut rng = thread_rng();
-    let values = iter::repeat_with(|| rng.gen_range(0.0..1.0)).take(len);
-    let array = Float64Array::from_iter_values(values);
-    Ok(ColumnarValue::Array(Arc::new(array)))
-}
-
-#[cfg(test)]
-mod test {
-    use std::sync::Arc;
-
-    use arrow::array::NullArray;
-
-    use datafusion_common::cast::as_float64_array;
-    use datafusion_expr::ColumnarValue;
-
-    use crate::math::random::random;
-
-    #[test]
-    fn test_random_expression() {
-        let args = vec![ColumnarValue::Array(Arc::new(NullArray::new(1)))];
-        let array = random(&args)
-            .expect("failed to initialize function random")
-            .into_array(1)
-            .expect("Failed to convert to array");
-        let floats =
-            as_float64_array(&array).expect("failed to initialize function random");
-
-        assert_eq!(floats.len(), 1);
-        assert!(0.0 <= floats.value(0) && floats.value(0) < 1.0);
+    fn documentation(&self) -> Option<&Documentation> {
+        self.doc()
     }
 }

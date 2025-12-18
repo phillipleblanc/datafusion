@@ -17,15 +17,19 @@
 
 //! [`Partitioning`] and [`Distribution`] for `ExecutionPlans`
 
+use crate::{
+    EquivalenceProperties, PhysicalExpr, equivalence::ProjectionMapping,
+    expressions::UnKnownColumn, physical_exprs_equal,
+};
+use datafusion_physical_expr_common::physical_expr::format_physical_expr_list;
 use std::fmt;
+use std::fmt::Display;
 use std::sync::Arc;
-
-use crate::{physical_exprs_equal, EquivalenceProperties, PhysicalExpr};
 
 /// Output partitioning supported by [`ExecutionPlan`]s.
 ///
-/// When `executed`, `ExecutionPlan`s  produce one or more independent stream of
-/// data batches in parallel, referred to as partitions. The streams are Rust
+/// Calling [`ExecutionPlan::execute`] produce one or more independent streams of
+/// [`RecordBatch`]es in parallel, referred to as partitions. The streams are Rust
 /// `async` [`Stream`]s (a special kind of future). The number of output
 /// partitions varies based on the input and the operation performed.
 ///
@@ -84,16 +88,16 @@ use crate::{physical_exprs_equal, EquivalenceProperties, PhysicalExpr};
 ///                                                        └──────────┐│┌──────────┘
 ///                                                                   │││
 ///                                                                   │││
-/// RepartitionExec with one input
-/// that has 3 partitions, but                        3 (async) streams, that internally
-/// itself has only 1 output partition                  pull from the same input stream
+/// RepartitionExec with 1 input
+/// partition and 3 output partitions                 3 (async) streams, that internally
+///                                                    pull from the same input stream
 ///                                                                  ...
 /// ```
 ///
 /// # Additional Examples
 ///
 /// A simple `FileScanExec` might produce one output stream (partition) for each
-/// file (note the actual DataFusion file scaners can read individual files in
+/// file (note the actual DataFusion file scanners can read individual files in
 /// parallel, potentially producing multiple partitions per file)
 ///
 /// Plans such as `SortPreservingMerge` produce a single output stream
@@ -102,6 +106,8 @@ use crate::{physical_exprs_equal, EquivalenceProperties, PhysicalExpr};
 /// Plans such as `FilterExec` produce the same number of output streams
 /// (partitions) as input streams (partitions).
 ///
+/// [`RecordBatch`]: arrow::record_batch::RecordBatch
+/// [`ExecutionPlan::execute`]: https://docs.rs/datafusion/latest/datafusion/physical_plan/trait.ExecutionPlan.html#tymethod.execute
 /// [`ExecutionPlan`]: https://docs.rs/datafusion/latest/datafusion/physical_plan/trait.ExecutionPlan.html
 /// [`Stream`]: https://docs.rs/futures/latest/futures/stream/trait.Stream.html
 #[derive(Debug, Clone)]
@@ -115,8 +121,8 @@ pub enum Partitioning {
     UnknownPartitioning(usize),
 }
 
-impl fmt::Display for Partitioning {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+impl Display for Partitioning {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Partitioning::RoundRobinBatch(size) => write!(f, "RoundRobinBatch({size})"),
             Partitioning::Hash(phy_exprs, size) => {
@@ -152,6 +158,8 @@ impl Partitioning {
         match required {
             Distribution::UnspecifiedDistribution => true,
             Distribution::SinglePartition if self.partition_count() == 1 => true,
+            // When partition count is 1, hash requirement is satisfied.
+            Distribution::HashPartitioned(_) if self.partition_count() == 1 => true,
             Distribution::HashPartitioned(required_exprs) => {
                 match self {
                     // Here we do not check the partition count for hash partitioning and assumes the partition count
@@ -167,11 +175,11 @@ impl Partitioning {
                             if !eq_groups.is_empty() {
                                 let normalized_required_exprs = required_exprs
                                     .iter()
-                                    .map(|e| eq_groups.normalize_expr(e.clone()))
+                                    .map(|e| eq_groups.normalize_expr(Arc::clone(e)))
                                     .collect::<Vec<_>>();
                                 let normalized_partition_exprs = partition_exprs
                                     .iter()
-                                    .map(|e| eq_groups.normalize_expr(e.clone()))
+                                    .map(|e| eq_groups.normalize_expr(Arc::clone(e)))
                                     .collect::<Vec<_>>();
                                 return physical_exprs_equal(
                                     &normalized_required_exprs,
@@ -185,6 +193,28 @@ impl Partitioning {
                 }
             }
             _ => false,
+        }
+    }
+
+    /// Calculate the output partitioning after applying the given projection.
+    pub fn project(
+        &self,
+        mapping: &ProjectionMapping,
+        input_eq_properties: &EquivalenceProperties,
+    ) -> Self {
+        if let Partitioning::Hash(exprs, part) = self {
+            let normalized_exprs = input_eq_properties
+                .project_expressions(exprs, mapping)
+                .zip(exprs)
+                .map(|(proj_expr, expr)| {
+                    proj_expr.unwrap_or_else(|| {
+                        Arc::new(UnKnownColumn::new(&expr.to_string()))
+                    })
+                })
+                .collect();
+            Partitioning::Hash(normalized_exprs, *part)
+        } else {
+            self.clone()
         }
     }
 }
@@ -234,9 +264,20 @@ impl Distribution {
     }
 }
 
+impl Display for Distribution {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Distribution::UnspecifiedDistribution => write!(f, "Unspecified"),
+            Distribution::SinglePartition => write!(f, "SinglePartition"),
+            Distribution::HashPartitioned(exprs) => {
+                write!(f, "HashPartitioned[{}])", format_physical_expr_list(exprs))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use super::*;
     use crate::expressions::Column;
@@ -291,7 +332,7 @@ mod tests {
                     assert_eq!(result, (true, false, false, false, false))
                 }
                 Distribution::HashPartitioned(_) => {
-                    assert_eq!(result, (false, false, false, true, false))
+                    assert_eq!(result, (true, false, false, true, false))
                 }
             }
         }

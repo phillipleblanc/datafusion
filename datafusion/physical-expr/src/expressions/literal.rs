@@ -18,30 +18,64 @@
 //! Literal expressions for physical operations
 
 use std::any::Any;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::sync::Arc;
 
-use crate::physical_expr::down_cast_any_ref;
-use crate::sort_properties::SortProperties;
-use crate::PhysicalExpr;
+use crate::physical_expr::PhysicalExpr;
 
+use arrow::datatypes::{Field, FieldRef};
 use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
+use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::{Result, ScalarValue};
-use datafusion_expr::{ColumnarValue, Expr};
+use datafusion_expr::Expr;
+use datafusion_expr_common::columnar_value::ColumnarValue;
+use datafusion_expr_common::interval_arithmetic::Interval;
+use datafusion_expr_common::sort_properties::{ExprProperties, SortProperties};
 
 /// Represents a literal value
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Literal {
     value: ScalarValue,
+    field: FieldRef,
+}
+
+impl Hash for Literal {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+        let metadata = self.field.metadata();
+        let mut keys = metadata.keys().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            key.hash(state);
+            metadata.get(key).unwrap().hash(state);
+        }
+    }
 }
 
 impl Literal {
     /// Create a literal value expression
     pub fn new(value: ScalarValue) -> Self {
-        Self { value }
+        Self::new_with_metadata(value, None)
+    }
+
+    /// Create a literal value expression
+    pub fn new_with_metadata(
+        value: ScalarValue,
+        metadata: Option<FieldMetadata>,
+    ) -> Self {
+        let mut field = Field::new("lit".to_string(), value.data_type(), value.is_null());
+
+        if let Some(metadata) = metadata {
+            field = metadata.add_to_field(field);
+        }
+
+        Self {
+            value,
+            field: field.into(),
+        }
     }
 
     /// Get the scalar value
@@ -70,11 +104,15 @@ impl PhysicalExpr for Literal {
         Ok(self.value.is_null())
     }
 
+    fn return_field(&self, _input_schema: &Schema) -> Result<FieldRef> {
+        Ok(Arc::clone(&self.field))
+    }
+
     fn evaluate(&self, _batch: &RecordBatch) -> Result<ColumnarValue> {
         Ok(ColumnarValue::Scalar(self.value.clone()))
     }
 
-    fn children(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
         vec![]
     }
 
@@ -85,29 +123,24 @@ impl PhysicalExpr for Literal {
         Ok(self)
     }
 
-    fn dyn_hash(&self, state: &mut dyn Hasher) {
-        let mut s = state;
-        self.hash(&mut s);
+    fn get_properties(&self, _children: &[ExprProperties]) -> Result<ExprProperties> {
+        Ok(ExprProperties {
+            sort_properties: SortProperties::Singleton,
+            range: Interval::try_new(self.value().clone(), self.value().clone())?,
+            preserves_lex_ordering: true,
+        })
     }
 
-    fn get_ordering(&self, _children: &[SortProperties]) -> SortProperties {
-        SortProperties::Singleton
-    }
-}
-
-impl PartialEq<dyn Any> for Literal {
-    fn eq(&self, other: &dyn Any) -> bool {
-        down_cast_any_ref(other)
-            .downcast_ref::<Self>()
-            .map(|x| self == x)
-            .unwrap_or(false)
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
     }
 }
 
 /// Create a literal expression
+#[expect(clippy::needless_pass_by_value)]
 pub fn lit<T: datafusion_expr::Literal>(value: T) -> Arc<dyn PhysicalExpr> {
     match value.lit() {
-        Expr::Literal(v) => Arc::new(Literal::new(v)),
+        Expr::Literal(v, _) => Arc::new(Literal::new(v)),
         _ => unreachable!(),
     }
 }
@@ -115,14 +148,15 @@ pub fn lit<T: datafusion_expr::Literal>(value: T) -> Arc<dyn PhysicalExpr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use arrow::array::Int32Array;
-    use arrow::datatypes::*;
+    use arrow::datatypes::Field;
     use datafusion_common::cast::as_int32_array;
-    use datafusion_common::Result;
+    use datafusion_physical_expr_common::physical_expr::fmt_sql;
 
     #[test]
     fn literal_i32() -> Result<()> {
-        // create an arbitrary record bacth
+        // create an arbitrary record batch
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
         let a = Int32Array::from(vec![Some(1), None, Some(3), Some(4), Some(5)]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)])?;
@@ -142,6 +176,18 @@ mod tests {
         for i in 0..literal_array.len() {
             assert_eq!(literal_array.value(i), 42);
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_fmt_sql() -> Result<()> {
+        // create and evaluate a literal expression
+        let expr = lit(42i32);
+        let display_string = expr.to_string();
+        assert_eq!(display_string, "42");
+        let sql_string = fmt_sql(expr.as_ref()).to_string();
+        assert_eq!(sql_string, "42");
 
         Ok(())
     }

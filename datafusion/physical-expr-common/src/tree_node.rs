@@ -20,13 +20,13 @@
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 
-use crate::physical_expr::{with_new_children_if_necessary, PhysicalExpr};
+use crate::physical_expr::{PhysicalExpr, with_new_children_if_necessary};
 
-use datafusion_common::tree_node::{ConcreteTreeNode, DynTreeNode};
 use datafusion_common::Result;
+use datafusion_common::tree_node::{ConcreteTreeNode, DynTreeNode};
 
 impl DynTreeNode for dyn PhysicalExpr {
-    fn arc_children(&self) -> Vec<Arc<Self>> {
+    fn arc_children(&self) -> Vec<&Arc<Self>> {
         self.children()
     }
 
@@ -62,7 +62,7 @@ impl<T> ExprContext<T> {
     }
 
     pub fn update_expr_from_children(mut self) -> Result<Self> {
-        let children_expr = self.children.iter().map(|c| c.expr.clone()).collect();
+        let children_expr = self.children.iter().map(|c| Arc::clone(&c.expr)).collect();
         self.expr = with_new_children_if_necessary(self.expr, children_expr)?;
         Ok(self)
     }
@@ -70,7 +70,12 @@ impl<T> ExprContext<T> {
 
 impl<T: Default> ExprContext<T> {
     pub fn new_default(plan: Arc<dyn PhysicalExpr>) -> Self {
-        let children = plan.children().into_iter().map(Self::new_default).collect();
+        let children = plan
+            .children()
+            .into_iter()
+            .cloned()
+            .map(Self::new_default)
+            .collect();
         Self::new(plan, Default::default(), children)
     }
 }
@@ -84,8 +89,8 @@ impl<T: Display> Display for ExprContext<T> {
 }
 
 impl<T> ConcreteTreeNode for ExprContext<T> {
-    fn children(&self) -> Vec<&Self> {
-        self.children.iter().collect()
+    fn children(&self) -> &[Self] {
+        &self.children
     }
 
     fn take_children(mut self) -> (Self, Vec<Self>) {

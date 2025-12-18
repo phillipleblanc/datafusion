@@ -17,41 +17,49 @@
 
 //! "crypto" DataFusion functions
 
+use datafusion_expr::ScalarUDF;
+use std::sync::Arc;
+
 pub mod basic;
 pub mod digest;
 pub mod md5;
-pub mod sha224;
-pub mod sha256;
-pub mod sha384;
-pub mod sha512;
-make_udf_function!(digest::DigestFunc, DIGEST, digest);
-make_udf_function!(md5::Md5Func, MD5, md5);
-make_udf_function!(sha224::SHA224Func, SHA224, sha224);
-make_udf_function!(sha256::SHA256Func, SHA256, sha256);
-make_udf_function!(sha384::SHA384Func, SHA384, sha384);
-make_udf_function!(sha512::SHA512Func, SHA512, sha512);
-export_functions!((
-    digest,
-    input_arg1 input_arg2,
-    "Computes the binary hash of an expression using the specified algorithm."
-),(
-    md5,
-    input_arg,
-    "Computes an MD5 128-bit checksum for a string expression."
-),(
-    sha224,
-    input_arg1,
-    "Computes the SHA-224 hash of a binary string."
-),(
-    sha256,
-    input_arg1,
-    "Computes the SHA-256 hash of a binary string."
-),(
-    sha384,
-    input_arg1,
-    "Computes the SHA-384 hash of a binary string."
-),(
-    sha512,
-    input_arg1,
-    "Computes the SHA-512 hash of a binary string."
-));
+pub mod sha;
+make_udf_function!(digest::DigestFunc, digest);
+make_udf_function!(md5::Md5Func, md5);
+make_udf_function!(sha::SHAFunc, sha224, sha::SHAFunc::sha224);
+make_udf_function!(sha::SHAFunc, sha256, sha::SHAFunc::sha256);
+make_udf_function!(sha::SHAFunc, sha384, sha::SHAFunc::sha384);
+make_udf_function!(sha::SHAFunc, sha512, sha::SHAFunc::sha512);
+
+pub mod expr_fn {
+    export_functions!((
+        digest,
+        "Computes the binary hash of an expression using the specified algorithm.",
+        input_arg1 input_arg2
+    ),(
+        md5,
+        "Computes an MD5 128-bit checksum for a string expression.",
+        input_arg
+    ),(
+        sha224,
+        "Computes the SHA-224 hash of a binary string.",
+        input_arg1
+    ),(
+        sha256,
+        "Computes the SHA-256 hash of a binary string.",
+        input_arg1
+    ),(
+        sha384,
+        "Computes the SHA-384 hash of a binary string.",
+        input_arg1
+    ),(
+        sha512,
+        "Computes the SHA-512 hash of a binary string.",
+        input_arg1
+    ));
+}
+
+/// Returns all DataFusion functions defined in this package
+pub fn functions() -> Vec<Arc<ScalarUDF>> {
+    vec![digest(), md5(), sha224(), sha256(), sha384(), sha512()]
+}

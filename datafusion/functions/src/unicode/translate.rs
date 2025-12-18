@@ -18,21 +18,49 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, GenericStringArray, OffsetSizeTrait};
+use arrow::array::{
+    ArrayAccessor, ArrayIter, ArrayRef, AsArray, GenericStringArray, OffsetSizeTrait,
+};
 use arrow::datatypes::DataType;
-use hashbrown::HashMap;
+use datafusion_common::HashMap;
 use unicode_segmentation::UnicodeSegmentation;
 
-use datafusion_common::cast::as_generic_string_array;
-use datafusion_common::{exec_err, Result};
-use datafusion_expr::TypeSignature::Exact;
-use datafusion_expr::{ColumnarValue, ScalarUDFImpl, Signature, Volatility};
-
 use crate::utils::{make_scalar_function, utf8_to_str_type};
+use datafusion_common::{Result, exec_err};
+use datafusion_expr::TypeSignature::Exact;
+use datafusion_expr::{
+    ColumnarValue, Documentation, ScalarUDFImpl, Signature, Volatility,
+};
+use datafusion_macros::user_doc;
 
-#[derive(Debug)]
+#[user_doc(
+    doc_section(label = "String Functions"),
+    description = "Translates characters in a string to specified translation characters.",
+    syntax_example = "translate(str, chars, translation)",
+    sql_example = r#"```sql
+> select translate('twice', 'wic', 'her');
++--------------------------------------------------+
+| translate(Utf8("twice"),Utf8("wic"),Utf8("her")) |
++--------------------------------------------------+
+| there                                            |
++--------------------------------------------------+
+```"#,
+    standard_argument(name = "str", prefix = "String"),
+    argument(name = "chars", description = "Characters to translate."),
+    argument(
+        name = "translation",
+        description = "Translation characters. Translation characters replace only characters at the same position in the **chars** string."
+    )
+)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct TranslateFunc {
     signature: Signature,
+}
+
+impl Default for TranslateFunc {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TranslateFunc {
@@ -40,7 +68,10 @@ impl TranslateFunc {
         use DataType::*;
         Self {
             signature: Signature::one_of(
-                vec![Exact(vec![Utf8, Utf8, Utf8])],
+                vec![
+                    Exact(vec![Utf8View, Utf8, Utf8]),
+                    Exact(vec![Utf8, Utf8, Utf8]),
+                ],
                 Volatility::Immutable,
             ),
         }
@@ -64,28 +95,62 @@ impl ScalarUDFImpl for TranslateFunc {
         utf8_to_str_type(&arg_types[0], "translate")
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
-        match args[0].data_type() {
-            DataType::Utf8 => make_scalar_function(translate::<i32>, vec![])(args),
-            DataType::LargeUtf8 => make_scalar_function(translate::<i64>, vec![])(args),
-            other => {
-                exec_err!("Unsupported data type {other:?} for function translate")
-            }
+    fn invoke_with_args(
+        &self,
+        args: datafusion_expr::ScalarFunctionArgs,
+    ) -> Result<ColumnarValue> {
+        make_scalar_function(invoke_translate, vec![])(&args.args)
+    }
+
+    fn documentation(&self) -> Option<&Documentation> {
+        self.doc()
+    }
+}
+
+fn invoke_translate(args: &[ArrayRef]) -> Result<ArrayRef> {
+    match args[0].data_type() {
+        DataType::Utf8View => {
+            let string_array = args[0].as_string_view();
+            let from_array = args[1].as_string::<i32>();
+            let to_array = args[2].as_string::<i32>();
+            translate::<i32, _, _>(string_array, from_array, to_array)
+        }
+        DataType::Utf8 => {
+            let string_array = args[0].as_string::<i32>();
+            let from_array = args[1].as_string::<i32>();
+            let to_array = args[2].as_string::<i32>();
+            translate::<i32, _, _>(string_array, from_array, to_array)
+        }
+        DataType::LargeUtf8 => {
+            let string_array = args[0].as_string::<i64>();
+            let from_array = args[1].as_string::<i64>();
+            let to_array = args[2].as_string::<i64>();
+            translate::<i64, _, _>(string_array, from_array, to_array)
+        }
+        other => {
+            exec_err!("Unsupported data type {other:?} for function translate")
         }
     }
 }
 
 /// Replaces each character in string that matches a character in the from set with the corresponding character in the to set. If from is longer than to, occurrences of the extra characters in from are deleted.
 /// translate('12345', '143', 'ax') = 'a2x5'
-fn translate<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
-    let string_array = as_generic_string_array::<T>(&args[0])?;
-    let from_array = as_generic_string_array::<T>(&args[1])?;
-    let to_array = as_generic_string_array::<T>(&args[2])?;
+fn translate<'a, T: OffsetSizeTrait, V, B>(
+    string_array: V,
+    from_array: B,
+    to_array: B,
+) -> Result<ArrayRef>
+where
+    V: ArrayAccessor<Item = &'a str>,
+    B: ArrayAccessor<Item = &'a str>,
+{
+    let string_array_iter = ArrayIter::new(string_array);
+    let from_array_iter = ArrayIter::new(from_array);
+    let to_array_iter = ArrayIter::new(to_array);
 
-    let result = string_array
-        .iter()
-        .zip(from_array.iter())
-        .zip(to_array.iter())
+    let result = string_array_iter
+        .zip(from_array_iter)
+        .zip(to_array_iter)
         .map(|((string, from), to)| match (string, from, to) {
             (Some(string), Some(from), Some(to)) => {
                 // create a hashmap of [char, index] to change from O(n) to O(1) for from list
@@ -134,7 +199,7 @@ mod tests {
     fn test_functions() -> Result<()> {
         test_function!(
             TranslateFunc::new(),
-            &[
+            vec![
                 ColumnarValue::Scalar(ScalarValue::from("12345")),
                 ColumnarValue::Scalar(ScalarValue::from("143")),
                 ColumnarValue::Scalar(ScalarValue::from("ax"))
@@ -146,7 +211,7 @@ mod tests {
         );
         test_function!(
             TranslateFunc::new(),
-            &[
+            vec![
                 ColumnarValue::Scalar(ScalarValue::Utf8(None)),
                 ColumnarValue::Scalar(ScalarValue::from("143")),
                 ColumnarValue::Scalar(ScalarValue::from("ax"))
@@ -158,7 +223,7 @@ mod tests {
         );
         test_function!(
             TranslateFunc::new(),
-            &[
+            vec![
                 ColumnarValue::Scalar(ScalarValue::from("12345")),
                 ColumnarValue::Scalar(ScalarValue::Utf8(None)),
                 ColumnarValue::Scalar(ScalarValue::from("ax"))
@@ -170,7 +235,7 @@ mod tests {
         );
         test_function!(
             TranslateFunc::new(),
-            &[
+            vec![
                 ColumnarValue::Scalar(ScalarValue::from("12345")),
                 ColumnarValue::Scalar(ScalarValue::from("143")),
                 ColumnarValue::Scalar(ScalarValue::Utf8(None))
@@ -182,7 +247,7 @@ mod tests {
         );
         test_function!(
             TranslateFunc::new(),
-            &[
+            vec![
                 ColumnarValue::Scalar(ScalarValue::from("é2íñ5")),
                 ColumnarValue::Scalar(ScalarValue::from("éñí")),
                 ColumnarValue::Scalar(ScalarValue::from("óü")),
@@ -195,7 +260,7 @@ mod tests {
         #[cfg(not(feature = "unicode_expressions"))]
         test_function!(
             TranslateFunc::new(),
-            &[
+            vec![
                 ColumnarValue::Scalar(ScalarValue::from("12345")),
                 ColumnarValue::Scalar(ScalarValue::from("143")),
                 ColumnarValue::Scalar(ScalarValue::from("ax")),

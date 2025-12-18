@@ -20,13 +20,13 @@
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 
-use crate::{displayable, with_new_children_if_necessary, ExecutionPlan};
+use crate::{ExecutionPlan, displayable, with_new_children_if_necessary};
 
-use datafusion_common::tree_node::{ConcreteTreeNode, DynTreeNode};
 use datafusion_common::Result;
+use datafusion_common::tree_node::{ConcreteTreeNode, DynTreeNode};
 
 impl DynTreeNode for dyn ExecutionPlan {
-    fn arc_children(&self) -> Vec<Arc<Self>> {
+    fn arc_children(&self) -> Vec<&Arc<Self>> {
         self.children()
     }
 
@@ -39,9 +39,17 @@ impl DynTreeNode for dyn ExecutionPlan {
     }
 }
 
-/// A node object beneficial for writing optimizer rules, encapsulating an [`ExecutionPlan`] node with a payload.
-/// Since there are two ways to access child plans—directly from the plan and through child nodes—it's recommended
+/// A node context object beneficial for writing optimizer rules.
+/// This context encapsulating an [`ExecutionPlan`] node with a payload.
+///
+/// Since each wrapped node has it's children within both the `PlanContext.plan.children()`,
+/// as well as separately within the `PlanContext.children` (which are child nodes wrapped in the context),
+/// it's important to keep these child plans in sync when performing mutations.
+///
+/// Since there are two ways to access child plans directly -— it's recommended
 /// to perform mutable operations via [`Self::update_plan_from_children`].
+/// After mutating the `PlanContext.children`, or after creating the `PlanContext`,
+/// call `update_plan_from_children` to sync.
 #[derive(Debug)]
 pub struct PlanContext<T: Sized> {
     /// The execution plan associated with this context.
@@ -61,16 +69,24 @@ impl<T> PlanContext<T> {
         }
     }
 
+    /// Update the `PlanContext.plan.children()` from the `PlanContext.children`,
+    /// if the `PlanContext.children` have been changed.
     pub fn update_plan_from_children(mut self) -> Result<Self> {
-        let children_plans = self.children.iter().map(|c| c.plan.clone()).collect();
+        let children_plans = self.children.iter().map(|c| Arc::clone(&c.plan)).collect();
         self.plan = with_new_children_if_necessary(self.plan, children_plans)?;
+
         Ok(self)
     }
 }
 
 impl<T: Default> PlanContext<T> {
     pub fn new_default(plan: Arc<dyn ExecutionPlan>) -> Self {
-        let children = plan.children().into_iter().map(Self::new_default).collect();
+        let children = plan
+            .children()
+            .into_iter()
+            .cloned()
+            .map(Self::new_default)
+            .collect();
         Self::new(plan, Default::default(), children)
     }
 }
@@ -78,15 +94,15 @@ impl<T: Default> PlanContext<T> {
 impl<T: Display> Display for PlanContext<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let node_string = displayable(self.plan.as_ref()).one_line();
-        write!(f, "Node plan: {}", node_string)?;
+        write!(f, "Node plan: {node_string}")?;
         write!(f, "Node data: {}", self.data)?;
         write!(f, "")
     }
 }
 
 impl<T> ConcreteTreeNode for PlanContext<T> {
-    fn children(&self) -> Vec<&Self> {
-        self.children.iter().collect()
+    fn children(&self) -> &[Self] {
+        &self.children
     }
 
     fn take_children(mut self) -> (Self, Vec<Self>) {

@@ -19,10 +19,11 @@
 //! [`ExprSimplifier`] simplifies individual `Expr`s.
 
 pub mod expr_simplifier;
-mod guarantees;
 mod inlist_simplifier;
 mod regex;
 pub mod simplify_exprs;
+mod simplify_predicates;
+mod unwrap_cast;
 mod utils;
 
 // backwards compatibility
@@ -30,3 +31,7 @@ pub use datafusion_expr::simplify::{SimplifyContext, SimplifyInfo};
 
 pub use expr_simplifier::*;
 pub use simplify_exprs::*;
+pub use simplify_predicates::simplify_predicates;
+
+// Export for test in datafusion/core/tests/optimizer_integration.rs
+pub use datafusion_expr::expr_rewriter::GuaranteeRewriter;

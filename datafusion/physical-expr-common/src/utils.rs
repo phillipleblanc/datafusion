@@ -15,13 +15,39 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::{
-    array::{make_array, Array, ArrayRef, BooleanArray, MutableArrayData},
-    compute::{and_kleene, is_not_null, SlicesIterator},
-};
-use datafusion_common::Result;
+use std::sync::Arc;
 
-use crate::sort_expr::PhysicalSortExpr;
+use crate::physical_expr::PhysicalExpr;
+use crate::tree_node::ExprContext;
+
+use arrow::array::{Array, ArrayRef, BooleanArray, MutableArrayData, make_array};
+use arrow::compute::{SlicesIterator, and_kleene, is_not_null};
+use arrow::record_batch::RecordBatch;
+use datafusion_common::Result;
+use datafusion_expr_common::sort_properties::ExprProperties;
+
+/// Represents a [`PhysicalExpr`] node with associated properties (order and
+/// range) in a context where properties are tracked.
+pub type ExprPropertiesNode = ExprContext<ExprProperties>;
+
+impl ExprPropertiesNode {
+    /// Constructs a new `ExprPropertiesNode` with unknown properties for a
+    /// given physical expression. This node initializes with default properties
+    /// and recursively applies this to all child expressions.
+    pub fn new_unknown(expr: Arc<dyn PhysicalExpr>) -> Self {
+        let children = expr
+            .children()
+            .into_iter()
+            .cloned()
+            .map(Self::new_unknown)
+            .collect();
+        Self {
+            expr,
+            data: ExprProperties::new_unknown(),
+            children,
+        }
+    }
+}
 
 /// Scatter `truthy` array by boolean mask. When the mask evaluates `true`, next values of `truthy`
 /// are taken, when the mask evaluates `false` values null values are filled.
@@ -66,17 +92,24 @@ pub fn scatter(mask: &BooleanArray, truthy: &dyn Array) -> Result<ArrayRef> {
     Ok(make_array(data))
 }
 
-/// Reverses the ORDER BY expression, which is useful during equivalent window
-/// expression construction. For instance, 'ORDER BY a ASC, NULLS LAST' turns into
-/// 'ORDER BY a DESC, NULLS FIRST'.
-pub fn reverse_order_bys(order_bys: &[PhysicalSortExpr]) -> Vec<PhysicalSortExpr> {
-    order_bys
-        .iter()
-        .map(|e| PhysicalSortExpr {
-            expr: e.expr.clone(),
-            options: !e.options,
+/// Evaluates expressions against a record batch.
+/// This will convert the resulting ColumnarValues to ArrayRefs,
+/// duplicating any ScalarValues that may have been returned,
+/// and validating that the returned arrays all have the same
+/// number of rows as the input batch.
+#[inline]
+pub fn evaluate_expressions_to_arrays<'a>(
+    exprs: impl IntoIterator<Item = &'a Arc<dyn PhysicalExpr>>,
+    batch: &RecordBatch,
+) -> Result<Vec<ArrayRef>> {
+    let num_rows = batch.num_rows();
+    exprs
+        .into_iter()
+        .map(|e| {
+            e.evaluate(batch)
+                .and_then(|col| col.into_array_of_size(num_rows))
         })
-        .collect()
+        .collect::<Result<Vec<ArrayRef>>>()
 }
 
 #[cfg(test)]
@@ -84,6 +117,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::Int32Array;
+
     use datafusion_common::cast::{as_boolean_array, as_int32_array};
 
     use super::*;

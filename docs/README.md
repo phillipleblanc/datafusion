@@ -21,29 +21,43 @@
 
 This folder contains the source content of the [User Guide](./source/user-guide)
 and [Contributor Guide](./source/contributor-guide). These are both published to
-https://arrow.apache.org/datafusion/ as part of the release process.
+https://datafusion.apache.org/ as part of the release process.
 
 ## Dependencies
 
 It's recommended to install build dependencies and build the documentation
 inside a Python virtualenv.
 
-- Python
-- `pip install -r requirements.txt`
+```sh
+python3 -m venv venv
+pip install -r requirements.txt
+```
+
+If using [uv](https://docs.astral.sh/uv/) the script can be run like so without
+needing to create a virtual environment:
+
+```sh
+uv run --with-requirements requirements.txt bash build.sh
+```
 
 ## Build & Preview
 
 Run the provided script to build the HTML pages.
 
 ```bash
+# If using venv, ensure you have activated it
 ./build.sh
 ```
 
-The HTML will be generated into a `build` directory.
+The HTML will be generated into a `build` directory. Open `build/html/index.html`
+in your preferred browser, e.g.
 
 Preview the site on Linux by running this command.
 
 ```bash
+# On macOS
+open build/html/index.html
+# On Linux with Firefox
 firefox build/html/index.html
 ```
 
@@ -55,15 +69,15 @@ automatically updated.
 
 ## Release Process
 
-This documentation is hosted at https://arrow.apache.org/datafusion/
+This documentation is hosted at https://datafusion.apache.org/
 
 When the PR is merged to the `main` branch of the DataFusion
-repository, a [github workflow](https://github.com/apache/arrow-datafusion/blob/main/.github/workflows/docs.yaml) which:
+repository, a [github workflow](https://github.com/apache/datafusion/blob/main/.github/workflows/docs.yaml) which:
 
 1. Builds the html content
-2. Pushes the html content to the [`asf-site`](https://github.com/apache/arrow-datafusion/tree/asf-site) branch in this repository.
+2. Pushes the html content to the [`asf-site`](https://github.com/apache/datafusion/tree/asf-site) branch in this repository.
 
-The Apache Software Foundation provides https://arrow.apache.org/,
+The Apache Software Foundation provides https://datafusion.apache.org/,
 which serves content based on the configuration in
-[.asf.yaml](https://github.com/apache/arrow-datafusion/blob/main/.asf.yaml),
-which specifies the target as https://arrow.apache.org/datafusion/.
+[.asf.yaml](https://github.com/apache/datafusion/blob/main/.asf.yaml),
+which specifies the target as https://datafusion.apache.org/.

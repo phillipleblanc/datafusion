@@ -16,38 +16,45 @@
 // under the License.
 
 //! Parquet integration tests
-use arrow::array::Decimal128Array;
+use crate::parquet::utils::MetricsFinder;
 use arrow::{
     array::{
-        Array, ArrayRef, BinaryArray, Date32Array, Date64Array, FixedSizeBinaryArray,
-        Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
+        Array, ArrayRef, BinaryArray, Date32Array, Date64Array, Decimal128Array,
+        DictionaryArray, FixedSizeBinaryArray, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        make_array,
     },
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
     util::pretty::pretty_format_batches,
 };
-use arrow_array::new_null_array;
 use chrono::{Datelike, Duration, TimeDelta};
 use datafusion::{
-    datasource::{physical_plan::ParquetExec, provider_as_source, TableProvider},
-    physical_plan::{accept, metrics::MetricsSet, ExecutionPlan, ExecutionPlanVisitor},
+    datasource::{TableProvider, provider_as_source},
+    physical_plan::metrics::MetricsSet,
     prelude::{ParquetReadOptions, SessionConfig, SessionContext},
 };
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion_physical_plan::metrics::MetricValue;
 use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 
 mod custom_reader;
+#[cfg(feature = "parquet_encryption")]
+mod encryption;
+mod external_access_plan;
 mod file_statistics;
 mod filter_pushdown;
 mod page_pruning;
 mod row_group_pruning;
 mod schema;
+mod schema_adapter;
 mod schema_coercion;
+mod utils;
 
 #[cfg(test)]
 #[ctor::ctor]
@@ -61,6 +68,7 @@ fn init() {
 // ----------------------
 
 /// What data to use
+#[derive(Debug, Clone)]
 enum Scenario {
     Timestamps,
     Dates,
@@ -74,35 +82,40 @@ enum Scenario {
     DecimalBloomFilterInt64,
     DecimalLargePrecision,
     DecimalLargePrecisionBloomFilter,
+    /// StringArray, BinaryArray, FixedSizeBinaryArray
     ByteArray,
     PeriodsInColumnNames,
     WithNullValues,
+    WithNullValuesPageLevel,
+    UTF8,
+    Dictionary,
 }
 
 enum Unit {
-    RowGroup,
-    Page,
+    // pass max row per row_group in parquet writer
+    RowGroup(usize),
+    // pass max row per page in parquet writer
+    Page(usize),
 }
 
 /// Test fixture that has an execution context that has an external
 /// table "t" registered, pointing at a parquet file made with
 /// `make_test_file`
 struct ContextWithParquet {
-    #[allow(dead_code)]
     /// temp file parquet data is written to. The file is cleaned up
     /// when dropped
-    file: NamedTempFile,
+    _file: NamedTempFile,
     provider: Arc<dyn TableProvider>,
     ctx: SessionContext,
 }
 
 /// The output of running one of the test cases
 struct TestOutput {
-    /// The input string
+    /// The input query SQL
     sql: String,
     /// Execution metrics for the Parquet Scan
     parquet_metrics: MetricsSet,
-    /// number of rows in results
+    /// number of actual rows in results
     result_rows: usize,
     /// the contents of the input, as a string
     pretty_input: String,
@@ -113,9 +126,43 @@ struct TestOutput {
 impl TestOutput {
     /// retrieve the value of the named metric, if any
     fn metric_value(&self, metric_name: &str) -> Option<usize> {
+        if let Some((pruned, _matched)) = self.pruning_metric(metric_name) {
+            return Some(pruned);
+        }
+
         self.parquet_metrics
             .sum(|metric| metric.value().name() == metric_name)
-            .map(|v| v.as_usize())
+            .map(|v| match v {
+                MetricValue::PruningMetrics {
+                    pruning_metrics, ..
+                } => pruning_metrics.pruned(),
+                _ => v.as_usize(),
+            })
+    }
+
+    fn pruning_metric(&self, metric_name: &str) -> Option<(usize, usize)> {
+        let mut total_pruned = 0;
+        let mut total_matched = 0;
+        let mut found = false;
+
+        for metric in self.parquet_metrics.iter() {
+            let metric = metric.as_ref();
+            if metric.value().name() == metric_name
+                && let MetricValue::PruningMetrics {
+                    pruning_metrics, ..
+                } = metric.value()
+            {
+                total_pruned += pruning_metrics.pruned();
+                total_matched += pruning_metrics.matched();
+                found = true;
+            }
+        }
+
+        if found {
+            Some((total_pruned, total_matched))
+        } else {
+            None
+        }
     }
 
     /// The number of times the pruning predicate evaluation errors
@@ -123,43 +170,52 @@ impl TestOutput {
         self.metric_value("predicate_evaluation_errors")
     }
 
-    /// The number of row_groups matched by bloom filter
-    fn row_groups_matched_bloom_filter(&self) -> Option<usize> {
-        self.metric_value("row_groups_matched_bloom_filter")
-    }
-
-    /// The number of row_groups pruned by bloom filter
-    fn row_groups_pruned_bloom_filter(&self) -> Option<usize> {
-        self.metric_value("row_groups_pruned_bloom_filter")
+    /// The number of row_groups pruned / matched by bloom filter
+    fn row_groups_bloom_filter(&self) -> Option<(usize, usize)> {
+        self.pruning_metric("row_groups_pruned_bloom_filter")
     }
 
     /// The number of row_groups matched by statistics
     fn row_groups_matched_statistics(&self) -> Option<usize> {
-        self.metric_value("row_groups_matched_statistics")
+        self.pruning_metric("row_groups_pruned_statistics")
+            .map(|(_pruned, matched)| matched)
     }
 
     /// The number of row_groups pruned by statistics
     fn row_groups_pruned_statistics(&self) -> Option<usize> {
-        self.metric_value("row_groups_pruned_statistics")
+        self.pruning_metric("row_groups_pruned_statistics")
+            .map(|(pruned, _matched)| pruned)
+    }
+
+    /// Metric `files_ranges_pruned_statistics` tracks both pruned and matched count,
+    /// for testing purpose, here it only aggregate the `pruned` count.
+    fn files_ranges_pruned_statistics(&self) -> Option<usize> {
+        self.pruning_metric("files_ranges_pruned_statistics")
+            .map(|(pruned, _matched)| pruned)
     }
 
     /// The number of row_groups matched by bloom filter or statistics
+    ///
+    /// E.g. starting with 10 row groups, statistics: 10 total -> 7 matched, bloom
+    /// filter: 7 total -> 3 matched, this function returns 3 for the final matched
+    /// count.
     fn row_groups_matched(&self) -> Option<usize> {
-        self.row_groups_matched_bloom_filter()
-            .zip(self.row_groups_matched_statistics())
-            .map(|(a, b)| a + b)
+        self.row_groups_bloom_filter()
+            .map(|(_pruned, matched)| matched)
     }
 
     /// The number of row_groups pruned
     fn row_groups_pruned(&self) -> Option<usize> {
-        self.row_groups_pruned_bloom_filter()
+        self.row_groups_bloom_filter()
+            .map(|(pruned, _matched)| pruned)
             .zip(self.row_groups_pruned_statistics())
             .map(|(a, b)| a + b)
     }
 
     /// The number of row pages pruned
     fn row_pages_pruned(&self) -> Option<usize> {
-        self.metric_value("page_index_rows_filtered")
+        self.pruning_metric("page_index_rows_pruned")
+            .map(|(pruned, _matched)| pruned)
     }
 
     fn description(&self) -> String {
@@ -183,14 +239,16 @@ impl ContextWithParquet {
         unit: Unit,
         mut config: SessionConfig,
     ) -> Self {
+        // Use a single partition for deterministic results no matter how many CPUs the host has
+        config = config.with_target_partitions(1);
         let file = match unit {
-            Unit::RowGroup => {
+            Unit::RowGroup(row_per_group) => {
                 config = config.with_parquet_bloom_filter_pruning(true);
-                make_test_file_rg(scenario).await
+                make_test_file_rg(scenario, row_per_group).await
             }
-            Unit::Page => {
+            Unit::Page(row_per_page) => {
                 config = config.with_parquet_page_index_pruning(true);
-                make_test_file_page(scenario).await
+                make_test_file_page(scenario, row_per_page).await
             }
         };
         let parquet_path = file.path().to_string_lossy();
@@ -205,7 +263,7 @@ impl ContextWithParquet {
         ctx.register_table("t", provider.clone()).unwrap();
 
         Self {
-            file,
+            _file: file,
             provider,
             ctx,
         }
@@ -271,25 +329,8 @@ impl ContextWithParquet {
             .expect("Running");
 
         // find the parquet metrics
-        struct MetricsFinder {
-            metrics: Option<MetricsSet>,
-        }
-        impl ExecutionPlanVisitor for MetricsFinder {
-            type Error = std::convert::Infallible;
-            fn pre_visit(
-                &mut self,
-                plan: &dyn ExecutionPlan,
-            ) -> Result<bool, Self::Error> {
-                if plan.as_any().downcast_ref::<ParquetExec>().is_some() {
-                    self.metrics = plan.metrics();
-                }
-                // stop searching once we have found the metrics
-                Ok(self.metrics.is_none())
-            }
-        }
-        let mut finder = MetricsFinder { metrics: None };
-        accept(physical_plan.as_ref(), &mut finder).unwrap();
-        let parquet_metrics = finder.metrics.unwrap();
+        let parquet_metrics =
+            MetricsFinder::find_metrics(physical_plan.as_ref()).unwrap();
 
         let result_rows = results.iter().map(|b| b.num_rows()).sum();
 
@@ -311,9 +352,13 @@ impl ContextWithParquet {
 ///
 /// Columns are named:
 /// "nanos" --> TimestampNanosecondArray
+/// "nanos_timezoned" --> TimestampNanosecondArray with timezone
 /// "micros" --> TimestampMicrosecondArray
+/// "micros_timezoned" --> TimestampMicrosecondArray with timezone
 /// "millis" --> TimestampMillisecondArray
+/// "millis_timezoned" --> TimestampMillisecondArray with timezone
 /// "seconds" --> TimestampSecondArray
+/// "seconds_timezoned" --> TimestampSecondArray with timezone
 /// "names" --> StringArray
 fn make_timestamp_batch(offset: Duration) -> RecordBatch {
     let ts_strings = vec![
@@ -323,6 +368,8 @@ fn make_timestamp_batch(offset: Duration) -> RecordBatch {
         None,
         Some("2020-01-02T01:01:01.0000000000001"),
     ];
+
+    let tz_string = "Pacific/Efate";
 
     let offset_nanos = offset.num_nanoseconds().expect("non overflow nanos");
 
@@ -361,19 +408,47 @@ fn make_timestamp_batch(offset: Duration) -> RecordBatch {
         .map(|(i, _)| format!("Row {i} + {offset}"))
         .collect::<Vec<_>>();
 
-    let arr_nanos = TimestampNanosecondArray::from(ts_nanos);
-    let arr_micros = TimestampMicrosecondArray::from(ts_micros);
-    let arr_millis = TimestampMillisecondArray::from(ts_millis);
-    let arr_seconds = TimestampSecondArray::from(ts_seconds);
+    let arr_nanos = TimestampNanosecondArray::from(ts_nanos.clone());
+    let arr_nanos_timezoned =
+        TimestampNanosecondArray::from(ts_nanos).with_timezone(tz_string);
+    let arr_micros = TimestampMicrosecondArray::from(ts_micros.clone());
+    let arr_micros_timezoned =
+        TimestampMicrosecondArray::from(ts_micros).with_timezone(tz_string);
+    let arr_millis = TimestampMillisecondArray::from(ts_millis.clone());
+    let arr_millis_timezoned =
+        TimestampMillisecondArray::from(ts_millis).with_timezone(tz_string);
+    let arr_seconds = TimestampSecondArray::from(ts_seconds.clone());
+    let arr_seconds_timezoned =
+        TimestampSecondArray::from(ts_seconds).with_timezone(tz_string);
 
     let names = names.iter().map(|s| s.as_str()).collect::<Vec<_>>();
     let arr_names = StringArray::from(names);
 
     let schema = Schema::new(vec![
         Field::new("nanos", arr_nanos.data_type().clone(), true),
+        Field::new(
+            "nanos_timezoned",
+            arr_nanos_timezoned.data_type().clone(),
+            true,
+        ),
         Field::new("micros", arr_micros.data_type().clone(), true),
+        Field::new(
+            "micros_timezoned",
+            arr_micros_timezoned.data_type().clone(),
+            true,
+        ),
         Field::new("millis", arr_millis.data_type().clone(), true),
+        Field::new(
+            "millis_timezoned",
+            arr_millis_timezoned.data_type().clone(),
+            true,
+        ),
         Field::new("seconds", arr_seconds.data_type().clone(), true),
+        Field::new(
+            "seconds_timezoned",
+            arr_seconds_timezoned.data_type().clone(),
+            true,
+        ),
         Field::new("name", arr_names.data_type().clone(), true),
     ]);
     let schema = Arc::new(schema);
@@ -382,9 +457,13 @@ fn make_timestamp_batch(offset: Duration) -> RecordBatch {
         schema,
         vec![
             Arc::new(arr_nanos),
+            Arc::new(arr_nanos_timezoned),
             Arc::new(arr_micros),
+            Arc::new(arr_micros_timezoned),
             Arc::new(arr_millis),
+            Arc::new(arr_millis_timezoned),
             Arc::new(arr_seconds),
+            Arc::new(arr_seconds_timezoned),
             Arc::new(arr_names),
         ],
     )
@@ -421,7 +500,7 @@ fn make_int_batches(start: i8, end: i8) -> RecordBatch {
     .unwrap()
 }
 
-/// Return record batch with i8, i16, i32, and i64 sequences
+/// Return record batch with u8, u16, u32, and u64 sequences
 ///
 /// Columns are named
 /// "u8" -> UInt8Array
@@ -572,14 +651,17 @@ fn make_date_batch(offset: Duration) -> RecordBatch {
 /// of the column. It is *not* a table named service.name
 ///
 /// name | service.name
+#[expect(clippy::needless_pass_by_value)]
 fn make_bytearray_batch(
     name: &str,
     string_values: Vec<&str>,
     binary_values: Vec<&[u8]>,
     fixedsize_values: Vec<&[u8; 3]>,
+    // i64 offset.
+    large_binary_values: Vec<&[u8]>,
 ) -> RecordBatch {
     let num_rows = string_values.len();
-    let name: StringArray = std::iter::repeat(Some(name)).take(num_rows).collect();
+    let name: StringArray = std::iter::repeat_n(Some(name), num_rows).collect();
     let service_string: StringArray = string_values.iter().map(Some).collect();
     let service_binary: BinaryArray = binary_values.iter().map(Some).collect();
     let service_fixedsize: FixedSizeBinaryArray = fixedsize_values
@@ -587,6 +669,8 @@ fn make_bytearray_batch(
         .map(|value| Some(value.as_slice()))
         .collect::<Vec<_>>()
         .into();
+    let service_large_binary: LargeBinaryArray =
+        large_binary_values.iter().map(Some).collect();
 
     let schema = Schema::new(vec![
         Field::new("name", name.data_type().clone(), true),
@@ -596,6 +680,11 @@ fn make_bytearray_batch(
         Field::new(
             "service_fixedsize",
             service_fixedsize.data_type().clone(),
+            true,
+        ),
+        Field::new(
+            "service_large_binary",
+            service_large_binary.data_type().clone(),
             true,
         ),
     ]);
@@ -608,6 +697,7 @@ fn make_bytearray_batch(
             Arc::new(service_string),
             Arc::new(service_binary),
             Arc::new(service_fixedsize),
+            Arc::new(service_large_binary),
         ],
     )
     .unwrap()
@@ -617,9 +707,10 @@ fn make_bytearray_batch(
 /// of the column. It is *not* a table named service.name
 ///
 /// name | service.name
+#[expect(clippy::needless_pass_by_value)]
 fn make_names_batch(name: &str, service_name_values: Vec<&str>) -> RecordBatch {
     let num_rows = service_name_values.len();
-    let name: StringArray = std::iter::repeat(Some(name)).take(num_rows).collect();
+    let name: StringArray = std::iter::repeat_n(Some(name), num_rows).collect();
     let service_name: StringArray = service_name_values.iter().map(Some).collect();
 
     let schema = Schema::new(vec![
@@ -632,8 +723,13 @@ fn make_names_batch(name: &str, service_name_values: Vec<&str>) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(name), Arc::new(service_name)]).unwrap()
 }
 
-/// Return record batch with i8, i16, i32, and i64 sequences with all Null values
-fn make_all_null_values() -> RecordBatch {
+/// Return record batch with i8, i16, i32, and i64 sequences with Null values
+/// here 5 rows in page when using Unit::Page
+fn make_int_batches_with_null(
+    null_values: usize,
+    no_null_values_start: usize,
+    no_null_values_end: usize,
+) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("i8", DataType::Int8, true),
         Field::new("i16", DataType::Int16, true),
@@ -641,18 +737,111 @@ fn make_all_null_values() -> RecordBatch {
         Field::new("i64", DataType::Int64, true),
     ]));
 
+    let v8: Vec<i8> = (no_null_values_start as _..no_null_values_end as _).collect();
+    let v16: Vec<i16> = (no_null_values_start as _..no_null_values_end as _).collect();
+    let v32: Vec<i32> = (no_null_values_start as _..no_null_values_end as _).collect();
+    let v64: Vec<i64> = (no_null_values_start as _..no_null_values_end as _).collect();
+
     RecordBatch::try_new(
         schema,
         vec![
-            new_null_array(&DataType::Int8, 5),
-            new_null_array(&DataType::Int16, 5),
-            new_null_array(&DataType::Int32, 5),
-            new_null_array(&DataType::Int64, 5),
+            make_array(
+                Int8Array::from_iter(
+                    v8.into_iter()
+                        .map(Some)
+                        .chain(std::iter::repeat_n(None, null_values)),
+                )
+                .to_data(),
+            ),
+            make_array(
+                Int16Array::from_iter(
+                    v16.into_iter()
+                        .map(Some)
+                        .chain(std::iter::repeat_n(None, null_values)),
+                )
+                .to_data(),
+            ),
+            make_array(
+                Int32Array::from_iter(
+                    v32.into_iter()
+                        .map(Some)
+                        .chain(std::iter::repeat_n(None, null_values)),
+                )
+                .to_data(),
+            ),
+            make_array(
+                Int64Array::from_iter(
+                    v64.into_iter()
+                        .map(Some)
+                        .chain(std::iter::repeat_n(None, null_values)),
+                )
+                .to_data(),
+            ),
         ],
     )
     .unwrap()
 }
 
+fn make_utf8_batch(value: Vec<Option<&str>>) -> RecordBatch {
+    let utf8 = StringArray::from(value.clone());
+    let large_utf8 = LargeStringArray::from(value);
+    RecordBatch::try_from_iter(vec![
+        ("utf8", Arc::new(utf8) as _),
+        ("large_utf8", Arc::new(large_utf8) as _),
+    ])
+    .unwrap()
+}
+
+#[expect(clippy::needless_pass_by_value)]
+fn make_dictionary_batch(strings: Vec<&str>, integers: Vec<i32>) -> RecordBatch {
+    let keys = Int32Array::from_iter(0..strings.len() as i32);
+    let small_keys = Int16Array::from_iter(0..strings.len() as i16);
+
+    let utf8_values = StringArray::from(strings.clone());
+    let utf8_dict = DictionaryArray::new(keys.clone(), Arc::new(utf8_values));
+
+    let large_utf8 = LargeStringArray::from(strings.clone());
+    let large_utf8_dict = DictionaryArray::new(keys.clone(), Arc::new(large_utf8));
+
+    let binary =
+        BinaryArray::from_iter_values(strings.iter().cloned().map(|v| v.as_bytes()));
+    let binary_dict = DictionaryArray::new(keys.clone(), Arc::new(binary));
+
+    let large_binary =
+        LargeBinaryArray::from_iter_values(strings.iter().cloned().map(|v| v.as_bytes()));
+    let large_binary_dict = DictionaryArray::new(keys.clone(), Arc::new(large_binary));
+
+    let int32 = Int32Array::from_iter_values(integers.clone());
+    let int32_dict = DictionaryArray::new(small_keys.clone(), Arc::new(int32));
+
+    let int64 = Int64Array::from_iter_values(integers.iter().cloned().map(|v| v as i64));
+    let int64_dict = DictionaryArray::new(keys.clone(), Arc::new(int64));
+
+    let uint32 =
+        UInt32Array::from_iter_values(integers.iter().cloned().map(|v| v as u32));
+    let uint32_dict = DictionaryArray::new(small_keys.clone(), Arc::new(uint32));
+
+    let decimal = Decimal128Array::from_iter_values(
+        integers.iter().cloned().map(|v| (v * 100) as i128),
+    )
+    .with_precision_and_scale(6, 2)
+    .unwrap();
+    let decimal_dict = DictionaryArray::new(keys.clone(), Arc::new(decimal));
+
+    RecordBatch::try_from_iter(vec![
+        ("utf8", Arc::new(utf8_dict) as _),
+        ("large_utf8", Arc::new(large_utf8_dict) as _),
+        ("binary", Arc::new(binary_dict) as _),
+        ("large_binary", Arc::new(large_binary_dict) as _),
+        ("int32", Arc::new(int32_dict) as _),
+        ("int64", Arc::new(int64_dict) as _),
+        ("uint32", Arc::new(uint32_dict) as _),
+        ("decimal", Arc::new(decimal_dict) as _),
+    ])
+    .unwrap()
+}
+
+#[expect(clippy::needless_pass_by_value)]
 fn create_data_batch(scenario: Scenario) -> Vec<RecordBatch> {
     match scenario {
         Scenario::Timestamps => {
@@ -693,6 +882,7 @@ fn create_data_batch(scenario: Scenario) -> Vec<RecordBatch> {
         Scenario::UInt32Range => {
             vec![make_uint32_range(0, 10), make_uint32_range(200000, 300000)]
         }
+
         Scenario::Float64 => {
             vec![
                 make_f64_batch(vec![-5.0, -4.0, -3.0, -2.0, -1.0]),
@@ -709,6 +899,7 @@ fn create_data_batch(scenario: Scenario) -> Vec<RecordBatch> {
                 make_decimal_batch(vec![2000, 3000, 3000, 4000, 6000], 9, 2),
             ]
         }
+
         Scenario::DecimalBloomFilterInt32 => {
             // decimal record batch
             vec![
@@ -764,6 +955,13 @@ fn create_data_batch(scenario: Scenario) -> Vec<RecordBatch> {
                         b"frontend five",
                     ],
                     vec![b"fe1", b"fe2", b"fe3", b"fe7", b"fe5"],
+                    vec![
+                        b"frontend one",
+                        b"frontend two",
+                        b"frontend three",
+                        b"frontend seven",
+                        b"frontend five",
+                    ],
                 ),
                 make_bytearray_batch(
                     "mixed",
@@ -782,6 +980,13 @@ fn create_data_batch(scenario: Scenario) -> Vec<RecordBatch> {
                         b"backend three",
                     ],
                     vec![b"fe6", b"fe4", b"be1", b"be2", b"be3"],
+                    vec![
+                        b"frontend six",
+                        b"frontend four",
+                        b"backend one",
+                        b"backend two",
+                        b"backend three",
+                    ],
                 ),
                 make_bytearray_batch(
                     "all backends",
@@ -800,9 +1005,17 @@ fn create_data_batch(scenario: Scenario) -> Vec<RecordBatch> {
                         b"backend eight",
                     ],
                     vec![b"be4", b"be5", b"be6", b"be7", b"be8"],
+                    vec![
+                        b"backend four",
+                        b"backend five",
+                        b"backend six",
+                        b"backend seven",
+                        b"backend eight",
+                    ],
                 ),
             ]
         }
+
         Scenario::PeriodsInColumnNames => {
             vec![
                 // all frontend
@@ -824,16 +1037,44 @@ fn create_data_batch(scenario: Scenario) -> Vec<RecordBatch> {
         }
         Scenario::WithNullValues => {
             vec![
-                make_all_null_values(),
+                make_int_batches_with_null(5, 0, 0),
                 make_int_batches(1, 6),
-                make_all_null_values(),
+                make_int_batches_with_null(5, 0, 0),
+            ]
+        }
+        Scenario::WithNullValuesPageLevel => {
+            vec![
+                make_int_batches_with_null(5, 1, 6),
+                make_int_batches(1, 11),
+                make_int_batches_with_null(1, 1, 10),
+                make_int_batches_with_null(5, 1, 6),
+            ]
+        }
+
+        Scenario::UTF8 => {
+            vec![
+                make_utf8_batch(vec![Some("a"), Some("b"), Some("c"), Some("d"), None]),
+                make_utf8_batch(vec![
+                    Some("e"),
+                    Some("f"),
+                    Some("g"),
+                    Some("h"),
+                    Some("i"),
+                ]),
+            ]
+        }
+
+        Scenario::Dictionary => {
+            vec![
+                make_dictionary_batch(vec!["a", "b", "c", "d", "e"], vec![0, 1, 2, 5, 6]),
+                make_dictionary_batch(vec!["f", "g", "h", "i", "j"], vec![0, 1, 3, 8, 9]),
             ]
         }
     }
 }
 
 /// Create a test parquet file with various data types
-async fn make_test_file_rg(scenario: Scenario) -> NamedTempFile {
+async fn make_test_file_rg(scenario: Scenario, row_per_group: usize) -> NamedTempFile {
     let mut output_file = tempfile::Builder::new()
         .prefix("parquet_pruning")
         .suffix(".parquet")
@@ -841,12 +1082,12 @@ async fn make_test_file_rg(scenario: Scenario) -> NamedTempFile {
         .expect("tempfile creation");
 
     let props = WriterProperties::builder()
-        .set_max_row_group_size(5)
+        .set_max_row_group_size(row_per_group)
         .set_bloom_filter_enabled(true)
+        .set_statistics_enabled(EnabledStatistics::Page)
         .build();
 
     let batches = create_data_batch(scenario);
-
     let schema = batches[0].schema();
 
     let mut writer = ArrowWriter::try_new(&mut output_file, schema, Some(props)).unwrap();
@@ -859,17 +1100,17 @@ async fn make_test_file_rg(scenario: Scenario) -> NamedTempFile {
     output_file
 }
 
-async fn make_test_file_page(scenario: Scenario) -> NamedTempFile {
+async fn make_test_file_page(scenario: Scenario, row_per_page: usize) -> NamedTempFile {
     let mut output_file = tempfile::Builder::new()
         .prefix("parquet_page_pruning")
         .suffix(".parquet")
         .tempfile()
         .expect("tempfile creation");
 
-    // set row count to 5, should get same result as rowGroup
+    // set row count to row_per_page, should get same result as rowGroup
     let props = WriterProperties::builder()
-        .set_data_page_row_count_limit(5)
-        .set_write_batch_size(5)
+        .set_data_page_row_count_limit(row_per_page)
+        .set_write_batch_size(row_per_page)
         .build();
 
     let batches = create_data_batch(scenario);

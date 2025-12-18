@@ -15,44 +15,65 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! FilterExec evaluates a boolean predicate against all input batches to determine which rows to
-//! include in its output batches.
-
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
+
+use itertools::Itertools;
 
 use super::{
     ColumnStatistics, DisplayAs, ExecutionPlanProperties, PlanProperties,
     RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
+use crate::coalesce::LimitedBatchCoalescer;
+use crate::coalesce::PushBatchStatus::LimitReached;
+use crate::common::can_project;
+use crate::execution_plan::CardinalityEffect;
+use crate::filter_pushdown::{
+    ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
+    FilterPushdownPropagation, PushedDown, PushedDownPredicate,
+};
+use crate::metrics::{MetricBuilder, MetricType};
+use crate::projection::{
+    EmbeddedProjection, ProjectionExec, ProjectionExpr, make_with_child,
+    try_embed_projection, update_expr,
+};
 use crate::{
-    metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
     DisplayFormatType, ExecutionPlan,
+    metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RatioMetrics},
 };
 
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::cast::as_boolean_array;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::Precision;
-use datafusion_common::{plan_err, DataFusionError, Result};
+use datafusion_common::{
+    DataFusionError, Result, ScalarValue, internal_err, plan_err, project_schema,
+};
 use datafusion_execution::TaskContext;
 use datafusion_expr::Operator;
-use datafusion_physical_expr::expressions::BinaryExpr;
+use datafusion_physical_expr::equivalence::ProjectionMapping;
+use datafusion_physical_expr::expressions::{BinaryExpr, Column, lit};
 use datafusion_physical_expr::intervals::utils::check_support;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{
-    analyze, split_conjunction, AnalysisContext, ExprBoundaries, PhysicalExpr,
+    AcrossPartitions, AnalysisContext, ConstExpr, ExprBoundaries, PhysicalExpr, analyze,
+    conjunction, split_conjunction,
 };
 
+use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use futures::stream::{Stream, StreamExt};
 use log::trace;
 
+const FILTER_EXEC_DEFAULT_SELECTIVITY: u8 = 20;
+const FILTER_EXEC_DEFAULT_BATCH_SIZE: usize = 8192;
+
 /// FilterExec evaluates a boolean predicate against all input batches to determine which rows to
 /// include in its output batches.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FilterExec {
     /// The expression to filter on. This expression must evaluate to a boolean value.
     predicate: Arc<dyn PhysicalExpr>,
@@ -60,32 +81,47 @@ pub struct FilterExec {
     input: Arc<dyn ExecutionPlan>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
-    /// Selectivity for statistics. 0 = no rows, 100 all rows
+    /// Selectivity for statistics. 0 = no rows, 100 = all rows
     default_selectivity: u8,
+    /// Properties equivalence properties, partitioning, etc.
     cache: PlanProperties,
+    /// The projection indices of the columns in the output schema of join
+    projection: Option<Vec<usize>>,
+    /// Target batch size for output batches
+    batch_size: usize,
+    /// Number of rows to fetch
+    fetch: Option<usize>,
 }
 
 impl FilterExec {
     /// Create a FilterExec on an input
+    #[expect(clippy::needless_pass_by_value)]
     pub fn try_new(
         predicate: Arc<dyn PhysicalExpr>,
         input: Arc<dyn ExecutionPlan>,
     ) -> Result<Self> {
         match predicate.data_type(input.schema().as_ref())? {
             DataType::Boolean => {
-                let default_selectivity = 20;
-                let cache =
-                    Self::compute_properties(&input, &predicate, default_selectivity)?;
+                let default_selectivity = FILTER_EXEC_DEFAULT_SELECTIVITY;
+                let cache = Self::compute_properties(
+                    &input,
+                    &predicate,
+                    default_selectivity,
+                    None,
+                )?;
                 Ok(Self {
                     predicate,
-                    input: input.clone(),
+                    input: Arc::clone(&input),
                     metrics: ExecutionPlanMetricsSet::new(),
                     default_selectivity,
                     cache,
+                    projection: None,
+                    batch_size: FILTER_EXEC_DEFAULT_BATCH_SIZE,
+                    fetch: None,
                 })
             }
             other => {
-                plan_err!("Filter predicate must return boolean values, not {other:?}")
+                plan_err!("Filter predicate must return BOOLEAN values, got {other:?}")
             }
         }
     }
@@ -95,10 +131,56 @@ impl FilterExec {
         default_selectivity: u8,
     ) -> Result<Self, DataFusionError> {
         if default_selectivity > 100 {
-            return plan_err!("Default filter selectivity needs to be less than 100");
+            return plan_err!(
+                "Default filter selectivity value needs to be less than or equal to 100"
+            );
         }
         self.default_selectivity = default_selectivity;
         Ok(self)
+    }
+
+    /// Return new instance of [FilterExec] with the given projection.
+    pub fn with_projection(&self, projection: Option<Vec<usize>>) -> Result<Self> {
+        //  Check if the projection is valid
+        can_project(&self.schema(), projection.as_ref())?;
+
+        let projection = match projection {
+            Some(projection) => match &self.projection {
+                Some(p) => Some(projection.iter().map(|i| p[*i]).collect()),
+                None => Some(projection),
+            },
+            None => None,
+        };
+
+        let cache = Self::compute_properties(
+            &self.input,
+            &self.predicate,
+            self.default_selectivity,
+            projection.as_ref(),
+        )?;
+        Ok(Self {
+            predicate: Arc::clone(&self.predicate),
+            input: Arc::clone(&self.input),
+            metrics: self.metrics.clone(),
+            default_selectivity: self.default_selectivity,
+            cache,
+            projection,
+            batch_size: self.batch_size,
+            fetch: self.fetch,
+        })
+    }
+
+    pub fn with_batch_size(&self, batch_size: usize) -> Result<Self> {
+        Ok(Self {
+            predicate: Arc::clone(&self.predicate),
+            input: Arc::clone(&self.input),
+            metrics: self.metrics.clone(),
+            default_selectivity: self.default_selectivity,
+            cache: self.cache.clone(),
+            projection: self.projection.clone(),
+            batch_size,
+            fetch: self.fetch,
+        })
     }
 
     /// The expression to filter on. This expression must evaluate to a boolean value.
@@ -116,17 +198,21 @@ impl FilterExec {
         self.default_selectivity
     }
 
+    /// Projection
+    pub fn projection(&self) -> Option<&Vec<usize>> {
+        self.projection.as_ref()
+    }
+
     /// Calculates `Statistics` for `FilterExec`, by applying selectivity (either default, or estimated) to input statistics.
     fn statistics_helper(
-        input: &Arc<dyn ExecutionPlan>,
+        schema: &SchemaRef,
+        input_stats: Statistics,
         predicate: &Arc<dyn PhysicalExpr>,
         default_selectivity: u8,
     ) -> Result<Statistics> {
-        let input_stats = input.statistics()?;
-        let schema = input.schema();
-        if !check_support(predicate, &schema) {
+        if !check_support(predicate, schema) {
             let selectivity = default_selectivity as f64 / 100.0;
-            let mut stats = input_stats.into_inexact();
+            let mut stats = input_stats.to_inexact();
             stats.num_rows = stats.num_rows.with_estimated_selectivity(selectivity);
             stats.total_byte_size = stats
                 .total_byte_size
@@ -136,12 +222,10 @@ impl FilterExec {
 
         let num_rows = input_stats.num_rows;
         let total_byte_size = input_stats.total_byte_size;
-        let input_analysis_ctx = AnalysisContext::try_from_statistics(
-            &input.schema(),
-            &input_stats.column_statistics,
-        )?;
+        let input_analysis_ctx =
+            AnalysisContext::try_from_statistics(schema, &input_stats.column_statistics)?;
 
-        let analysis_ctx = analyze(predicate, input_analysis_ctx, &schema)?;
+        let analysis_ctx = analyze(predicate, input_analysis_ctx, schema)?;
 
         // Estimate (inexact) selectivity of predicate
         let selectivity = analysis_ctx.selectivity.unwrap_or(1.0);
@@ -162,19 +246,27 @@ impl FilterExec {
     fn extend_constants(
         input: &Arc<dyn ExecutionPlan>,
         predicate: &Arc<dyn PhysicalExpr>,
-    ) -> Vec<Arc<dyn PhysicalExpr>> {
+    ) -> Vec<ConstExpr> {
         let mut res_constants = Vec::new();
         let input_eqs = input.equivalence_properties();
 
         let conjunctions = split_conjunction(predicate);
         for conjunction in conjunctions {
-            if let Some(binary) = conjunction.as_any().downcast_ref::<BinaryExpr>() {
-                if binary.op() == &Operator::Eq {
-                    if input_eqs.is_expr_constant(binary.left()) {
-                        res_constants.push(binary.right().clone())
-                    } else if input_eqs.is_expr_constant(binary.right()) {
-                        res_constants.push(binary.left().clone())
-                    }
+            if let Some(binary) = conjunction.as_any().downcast_ref::<BinaryExpr>()
+                && binary.op() == &Operator::Eq
+            {
+                // Filter evaluates to single value for all partitions
+                if input_eqs.is_expr_constant(binary.left()).is_some() {
+                    let across = input_eqs
+                        .is_expr_constant(binary.right())
+                        .unwrap_or_default();
+                    res_constants
+                        .push(ConstExpr::new(Arc::clone(binary.right()), across));
+                } else if input_eqs.is_expr_constant(binary.right()).is_some() {
+                    let across = input_eqs
+                        .is_expr_constant(binary.left())
+                        .unwrap_or_default();
+                    res_constants.push(ConstExpr::new(Arc::clone(binary.left()), across));
                 }
             }
         }
@@ -185,31 +277,56 @@ impl FilterExec {
         input: &Arc<dyn ExecutionPlan>,
         predicate: &Arc<dyn PhysicalExpr>,
         default_selectivity: u8,
+        projection: Option<&Vec<usize>>,
     ) -> Result<PlanProperties> {
         // Combine the equal predicates with the input equivalence properties
         // to construct the equivalence properties:
-        let stats = Self::statistics_helper(input, predicate, default_selectivity)?;
+        let schema = input.schema();
+        let stats = Self::statistics_helper(
+            &schema,
+            input.partition_statistics(None)?,
+            predicate,
+            default_selectivity,
+        )?;
         let mut eq_properties = input.equivalence_properties().clone();
-        let (equal_pairs, _) = collect_columns_from_predicate(predicate);
+        let (equal_pairs, _) = collect_columns_from_predicate_inner(predicate);
         for (lhs, rhs) in equal_pairs {
-            eq_properties.add_equal_conditions(lhs, rhs)
+            eq_properties.add_equal_conditions(Arc::clone(lhs), Arc::clone(rhs))?
         }
         // Add the columns that have only one viable value (singleton) after
         // filtering to constants.
         let constants = collect_columns(predicate)
             .into_iter()
             .filter(|column| stats.column_statistics[column.index()].is_singleton())
-            .map(|column| Arc::new(column) as _);
-        // this is for statistics
-        eq_properties = eq_properties.add_constants(constants);
-        // this is for logical constant (for example: a = '1', then a could be marked as a constant)
+            .map(|column| {
+                let value = stats.column_statistics[column.index()]
+                    .min_value
+                    .get_value();
+                let expr = Arc::new(column) as _;
+                ConstExpr::new(expr, AcrossPartitions::Uniform(value.cloned()))
+            });
+        // This is for statistics
+        eq_properties.add_constants(constants)?;
+        // This is for logical constant (for example: a = '1', then a could be marked as a constant)
         // to do: how to deal with multiple situation to represent = (for example c1 between 0 and 0)
-        eq_properties =
-            eq_properties.add_constants(Self::extend_constants(input, predicate));
+        eq_properties.add_constants(Self::extend_constants(input, predicate))?;
+
+        let mut output_partitioning = input.output_partitioning().clone();
+        // If contains projection, update the PlanProperties.
+        if let Some(projection) = projection {
+            let schema = eq_properties.schema();
+            let projection_mapping = ProjectionMapping::from_indices(projection, schema)?;
+            let out_schema = project_schema(schema, Some(projection))?;
+            output_partitioning =
+                output_partitioning.project(&projection_mapping, &eq_properties);
+            eq_properties = eq_properties.project(&projection_mapping, out_schema);
+        }
+
         Ok(PlanProperties::new(
             eq_properties,
-            input.output_partitioning().clone(), // Output Partitioning
-            input.execution_mode(),              // Execution Mode
+            output_partitioning,
+            input.pipeline_behavior(),
+            input.boundedness(),
         ))
     }
 }
@@ -222,7 +339,35 @@ impl DisplayAs for FilterExec {
     ) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "FilterExec: {}", self.predicate)
+                let display_projections = if let Some(projection) =
+                    self.projection.as_ref()
+                {
+                    format!(
+                        ", projection=[{}]",
+                        projection
+                            .iter()
+                            .map(|index| format!(
+                                "{}@{}",
+                                self.input.schema().fields().get(*index).unwrap().name(),
+                                index
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                } else {
+                    "".to_string()
+                };
+                let fetch = self
+                    .fetch
+                    .map_or_else(|| "".to_string(), |f| format!(", fetch={f}"));
+                write!(
+                    f,
+                    "FilterExec: {}{}{}",
+                    self.predicate, display_projections, fetch
+                )
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "predicate={}", fmt_sql(self.predicate.as_ref()))
             }
         }
     }
@@ -242,12 +387,12 @@ impl ExecutionPlan for FilterExec {
         &self.cache
     }
 
-    fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
-        vec![self.input.clone()]
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        // tell optimizer this operator doesn't reorder its input
+        // Tell optimizer this operator doesn't reorder its input
         vec![true]
     }
 
@@ -255,12 +400,13 @@ impl ExecutionPlan for FilterExec {
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        FilterExec::try_new(self.predicate.clone(), children.swap_remove(0))
+        FilterExec::try_new(Arc::clone(&self.predicate), children.swap_remove(0))
             .and_then(|e| {
                 let selectivity = e.default_selectivity();
                 e.with_default_selectivity(selectivity)
             })
-            .map(|e| Arc::new(e) as _)
+            .and_then(|e| e.with_projection(self.projection().cloned()))
+            .map(|e| e.with_fetch(self.fetch).unwrap())
     }
 
     fn execute(
@@ -268,13 +414,24 @@ impl ExecutionPlan for FilterExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        trace!("Start FilterExec::execute for partition {} of context session_id {} and task_id {:?}", partition, context.session_id(), context.task_id());
-        let baseline_metrics = BaselineMetrics::new(&self.metrics, partition);
+        trace!(
+            "Start FilterExec::execute for partition {} of context session_id {} and task_id {:?}",
+            partition,
+            context.session_id(),
+            context.task_id()
+        );
+        let metrics = FilterExecMetrics::new(&self.metrics, partition);
         Ok(Box::pin(FilterExecStream {
-            schema: self.input.schema(),
-            predicate: self.predicate.clone(),
+            schema: self.schema(),
+            predicate: Arc::clone(&self.predicate),
             input: self.input.execute(partition, context)?,
-            baseline_metrics,
+            metrics,
+            projection: self.projection.clone(),
+            batch_coalescer: LimitedBatchCoalescer::new(
+                self.schema(),
+                self.batch_size,
+                self.fetch,
+            ),
         }))
     }
 
@@ -285,7 +442,184 @@ impl ExecutionPlan for FilterExec {
     /// The output statistics of a filtering operation can be estimated if the
     /// predicate's selectivity value can be determined for the incoming data.
     fn statistics(&self) -> Result<Statistics> {
-        Self::statistics_helper(&self.input, self.predicate(), self.default_selectivity)
+        self.partition_statistics(None)
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+        let input_stats = self.input.partition_statistics(partition)?;
+        let schema = self.schema();
+        let stats = Self::statistics_helper(
+            &schema,
+            input_stats,
+            self.predicate(),
+            self.default_selectivity,
+        )?;
+        Ok(stats.project(self.projection.as_ref()))
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::LowerEqual
+    }
+
+    /// Tries to swap `projection` with its input (`filter`). If possible, performs
+    /// the swap and returns [`FilterExec`] as the top plan. Otherwise, returns `None`.
+    fn try_swapping_with_projection(
+        &self,
+        projection: &ProjectionExec,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // If the projection does not narrow the schema, we should not try to push it down:
+        if projection.expr().len() < projection.input().schema().fields().len() {
+            // Each column in the predicate expression must exist after the projection.
+            if let Some(new_predicate) =
+                update_expr(self.predicate(), projection.expr(), false)?
+            {
+                return FilterExec::try_new(
+                    new_predicate,
+                    make_with_child(projection, self.input())?,
+                )
+                .and_then(|e| {
+                    let selectivity = self.default_selectivity();
+                    e.with_default_selectivity(selectivity)
+                })
+                .map(|e| Some(Arc::new(e) as _));
+            }
+        }
+        try_embed_projection(projection, self)
+    }
+
+    fn gather_filters_for_pushdown(
+        &self,
+        phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        if !matches!(phase, FilterPushdownPhase::Pre) {
+            // For non-pre phase, filters pass through unchanged
+            let filter_supports = parent_filters
+                .into_iter()
+                .map(PushedDownPredicate::supported)
+                .collect();
+
+            return Ok(FilterDescription::new().with_child(ChildFilterDescription {
+                parent_filters: filter_supports,
+                self_filters: vec![],
+            }));
+        }
+
+        let child = ChildFilterDescription::from_child(&parent_filters, self.input())?
+            .with_self_filters(
+                split_conjunction(&self.predicate)
+                    .into_iter()
+                    .cloned()
+                    .collect(),
+            );
+
+        Ok(FilterDescription::new().with_child(child))
+    }
+
+    fn handle_child_pushdown_result(
+        &self,
+        phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        if !matches!(phase, FilterPushdownPhase::Pre) {
+            return Ok(FilterPushdownPropagation::if_all(child_pushdown_result));
+        }
+        // We absorb any parent filters that were not handled by our children
+        let unsupported_parent_filters =
+            child_pushdown_result.parent_filters.iter().filter_map(|f| {
+                matches!(f.all(), PushedDown::No).then_some(Arc::clone(&f.filter))
+            });
+        let unsupported_self_filters = child_pushdown_result
+            .self_filters
+            .first()
+            .expect("we have exactly one child")
+            .iter()
+            .filter_map(|f| match f.discriminant {
+                PushedDown::Yes => None,
+                PushedDown::No => Some(&f.predicate),
+            })
+            .cloned();
+
+        let unhandled_filters = unsupported_parent_filters
+            .into_iter()
+            .chain(unsupported_self_filters)
+            .collect_vec();
+
+        // If we have unhandled filters, we need to create a new FilterExec
+        let filter_input = Arc::clone(self.input());
+        let new_predicate = conjunction(unhandled_filters);
+        let updated_node = if new_predicate.eq(&lit(true)) {
+            // FilterExec is no longer needed, but we may need to leave a projection in place
+            match self.projection() {
+                Some(projection_indices) => {
+                    let filter_child_schema = filter_input.schema();
+                    let proj_exprs = projection_indices
+                        .iter()
+                        .map(|p| {
+                            let field = filter_child_schema.field(*p).clone();
+                            ProjectionExpr {
+                                expr: Arc::new(Column::new(field.name(), *p))
+                                    as Arc<dyn PhysicalExpr>,
+                                alias: field.name().to_string(),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    Some(Arc::new(ProjectionExec::try_new(proj_exprs, filter_input)?)
+                        as Arc<dyn ExecutionPlan>)
+                }
+                None => {
+                    // No projection needed, just return the input
+                    Some(filter_input)
+                }
+            }
+        } else if new_predicate.eq(&self.predicate) {
+            // The new predicate is the same as our current predicate
+            None
+        } else {
+            // Create a new FilterExec with the new predicate
+            let new = FilterExec {
+                predicate: Arc::clone(&new_predicate),
+                input: Arc::clone(&filter_input),
+                metrics: self.metrics.clone(),
+                default_selectivity: self.default_selectivity,
+                cache: Self::compute_properties(
+                    &filter_input,
+                    &new_predicate,
+                    self.default_selectivity,
+                    self.projection.as_ref(),
+                )?,
+                projection: None,
+                batch_size: self.batch_size,
+                fetch: self.fetch,
+            };
+            Some(Arc::new(new) as _)
+        };
+
+        Ok(FilterPushdownPropagation {
+            filters: vec![PushedDown::Yes; child_pushdown_result.parent_filters.len()],
+            updated_node,
+        })
+    }
+
+    fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        Some(Arc::new(Self {
+            predicate: Arc::clone(&self.predicate),
+            input: Arc::clone(&self.input),
+            metrics: self.metrics.clone(),
+            default_selectivity: self.default_selectivity,
+            cache: self.cache.clone(),
+            projection: self.projection.clone(),
+            batch_size: self.batch_size,
+            fetch,
+        }))
+    }
+}
+
+impl EmbeddedProjection for FilterExec {
+    fn with_projection(&self, projection: Option<Vec<usize>>) -> Result<Self> {
+        self.with_projection(projection)
     }
 }
 
@@ -309,6 +643,17 @@ fn collect_new_statistics(
                     ..
                 },
             )| {
+                let Some(interval) = interval else {
+                    // If the interval is `None`, we can say that there are no rows:
+                    return ColumnStatistics {
+                        null_count: Precision::Exact(0),
+                        max_value: Precision::Exact(ScalarValue::Null),
+                        min_value: Precision::Exact(ScalarValue::Null),
+                        sum_value: Precision::Exact(ScalarValue::Null),
+                        distinct_count: Precision::Exact(0),
+                        byte_size: input_column_stats[idx].byte_size,
+                    };
+                };
                 let (lower, upper) = interval.into_bounds();
                 let (min_value, max_value) = if lower.eq(&upper) {
                     (Precision::Exact(lower), Precision::Exact(upper))
@@ -316,10 +661,12 @@ fn collect_new_statistics(
                     (Precision::Inexact(lower), Precision::Inexact(upper))
                 };
                 ColumnStatistics {
-                    null_count: input_column_stats[idx].null_count.clone().to_inexact(),
+                    null_count: input_column_stats[idx].null_count.to_inexact(),
                     max_value,
                     min_value,
+                    sum_value: Precision::Absent,
                     distinct_count: distinct_count.to_inexact(),
+                    byte_size: input_column_stats[idx].byte_size,
                 }
             },
         )
@@ -329,27 +676,87 @@ fn collect_new_statistics(
 /// The FilterExec streams wraps the input iterator and applies the predicate expression to
 /// determine which rows to include in its output batches
 struct FilterExecStream {
-    /// Output schema, which is the same as the input schema for this operator
+    /// Output schema after the projection
     schema: SchemaRef,
     /// The expression to filter on. This expression must evaluate to a boolean value.
     predicate: Arc<dyn PhysicalExpr>,
     /// The input partition to filter.
     input: SendableRecordBatchStream,
-    /// runtime metrics recording
-    baseline_metrics: BaselineMetrics,
+    /// Runtime metrics recording
+    metrics: FilterExecMetrics,
+    /// The projection indices of the columns in the input schema
+    projection: Option<Vec<usize>>,
+    /// Batch coalescer to combine small batches
+    batch_coalescer: LimitedBatchCoalescer,
 }
 
-pub(crate) fn batch_filter(
+/// The metrics for `FilterExec`
+struct FilterExecMetrics {
+    /// Common metrics for most operators
+    baseline_metrics: BaselineMetrics,
+    /// Selectivity of the filter, calculated as output_rows / input_rows
+    selectivity: RatioMetrics,
+    // Remember to update `docs/source/user-guide/metrics.md` when adding new metrics,
+    // or modifying metrics comments
+}
+
+impl FilterExecMetrics {
+    pub fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+        Self {
+            baseline_metrics: BaselineMetrics::new(metrics, partition),
+            selectivity: MetricBuilder::new(metrics)
+                .with_type(MetricType::SUMMARY)
+                .ratio_metrics("selectivity", partition),
+        }
+    }
+}
+
+impl FilterExecStream {
+    fn flush_remaining_batches(
+        &mut self,
+    ) -> Poll<Option<std::result::Result<RecordBatch, DataFusionError>>> {
+        // Flush any remaining buffered batch
+        match self.batch_coalescer.finish() {
+            Ok(()) => {
+                Poll::Ready(self.batch_coalescer.next_completed_batch().map(|batch| {
+                    self.metrics.selectivity.add_part(batch.num_rows());
+                    Ok(batch)
+                }))
+            }
+            Err(e) => Poll::Ready(Some(Err(e))),
+        }
+    }
+}
+
+pub fn batch_filter(
     batch: &RecordBatch,
     predicate: &Arc<dyn PhysicalExpr>,
+) -> Result<RecordBatch> {
+    filter_and_project(batch, predicate, None)
+}
+
+fn filter_and_project(
+    batch: &RecordBatch,
+    predicate: &Arc<dyn PhysicalExpr>,
+    projection: Option<&Vec<usize>>,
 ) -> Result<RecordBatch> {
     predicate
         .evaluate(batch)
         .and_then(|v| v.into_array(batch.num_rows()))
         .and_then(|array| {
-            Ok(as_boolean_array(&array)?)
-                // apply filter array to record batch
-                .and_then(|filter_array| Ok(filter_record_batch(batch, filter_array)?))
+            Ok(match (as_boolean_array(&array), projection) {
+                // Apply filter array to record batch
+                (Ok(filter_array), None) => filter_record_batch(batch, filter_array)?,
+                (Ok(filter_array), Some(projection)) => {
+                    let projected_batch = batch.project(projection)?;
+                    filter_record_batch(&projected_batch, filter_array)?
+                }
+                (Err(_), _) => {
+                    return internal_err!(
+                        "Cannot create filter_array from non-boolean predicates"
+                    );
+                }
+            })
         })
 }
 
@@ -361,48 +768,98 @@ impl Stream for FilterExecStream {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let poll;
+        let elapsed_compute = self.metrics.baseline_metrics.elapsed_compute().clone();
         loop {
-            match self.input.poll_next_unpin(cx) {
-                Poll::Ready(value) => match value {
-                    Some(Ok(batch)) => {
-                        let timer = self.baseline_metrics.elapsed_compute().timer();
-                        let filtered_batch = batch_filter(&batch, &self.predicate)?;
-                        // skip entirely filtered batches
-                        if filtered_batch.num_rows() == 0 {
-                            continue;
+            match ready!(self.input.poll_next_unpin(cx)) {
+                Some(Ok(batch)) => {
+                    let timer = elapsed_compute.timer();
+                    let status = self.predicate.as_ref()
+                        .evaluate(&batch)
+                        .and_then(|v| v.into_array(batch.num_rows()))
+                        .and_then(|array| {
+                            Ok(match self.projection {
+                                Some(ref projection) => {
+                                    let projected_batch = batch.project(projection)?;
+                                    (array, projected_batch)
+                                },
+                                None => (array, batch)
+                            })
+                        }).and_then(|(array, batch)| {
+                            match as_boolean_array(&array) {
+                                Ok(filter_array) => {
+                                    self.metrics.selectivity.add_total(batch.num_rows());
+                                    // TODO: support push_batch_with_filter in LimitedBatchCoalescer
+                                    let batch = filter_record_batch(&batch, filter_array)?;
+                                    let state = self.batch_coalescer.push_batch(batch)?;
+                                    Ok(state)
+                                }
+                                Err(_) => {
+                                    internal_err!(
+                                        "Cannot create filter_array from non-boolean predicates"
+                                    )
+                                }
+                            }
+                        })?;
+                    timer.done();
+
+                    if let LimitReached = status {
+                        poll = self.flush_remaining_batches();
+                        break;
+                    }
+
+                    if let Some(batch) = self.batch_coalescer.next_completed_batch() {
+                        self.metrics.selectivity.add_part(batch.num_rows());
+                        poll = Poll::Ready(Some(Ok(batch)));
+                        break;
+                    }
+                    continue;
+                }
+                None => {
+                    // Flush any remaining buffered batch
+                    match self.batch_coalescer.finish() {
+                        Ok(()) => {
+                            poll = self.flush_remaining_batches();
                         }
-                        timer.done();
-                        poll = Poll::Ready(Some(Ok(filtered_batch)));
-                        break;
+                        Err(e) => {
+                            poll = Poll::Ready(Some(Err(e)));
+                        }
                     }
-                    _ => {
-                        poll = Poll::Ready(value);
-                        break;
-                    }
-                },
-                Poll::Pending => {
-                    poll = Poll::Pending;
+                    break;
+                }
+                value => {
+                    poll = Poll::Ready(value);
                     break;
                 }
             }
         }
-        self.baseline_metrics.record_poll(poll)
+        self.metrics.baseline_metrics.record_poll(poll)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        // same number of record batches
+        // Same number of record batches
         self.input.size_hint()
     }
 }
-
 impl RecordBatchStream for FilterExecStream {
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        Arc::clone(&self.schema)
     }
 }
 
 /// Return the equals Column-Pairs and Non-equals Column-Pairs
-fn collect_columns_from_predicate(predicate: &Arc<dyn PhysicalExpr>) -> EqualAndNonEqual {
+#[deprecated(
+    since = "51.0.0",
+    note = "This function will be internal in the future"
+)]
+pub fn collect_columns_from_predicate(
+    predicate: &'_ Arc<dyn PhysicalExpr>,
+) -> EqualAndNonEqual<'_> {
+    collect_columns_from_predicate_inner(predicate)
+}
+
+fn collect_columns_from_predicate_inner(
+    predicate: &'_ Arc<dyn PhysicalExpr>,
+) -> EqualAndNonEqual<'_> {
     let mut eq_predicate_columns = Vec::<PhysicalExprPairRef>::new();
     let mut ne_predicate_columns = Vec::<PhysicalExprPairRef>::new();
 
@@ -433,20 +890,13 @@ pub type EqualAndNonEqual<'a> =
 
 #[cfg(test)]
 mod tests {
-    use std::iter::Iterator;
-    use std::sync::Arc;
-
     use super::*;
+    use crate::empty::EmptyExec;
     use crate::expressions::*;
     use crate::test;
     use crate::test::exec::StatisticsExec;
-    use crate::ExecutionPlan;
-
-    use crate::empty::EmptyExec;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow_schema::{UnionFields, UnionMode};
-    use datafusion_common::{ColumnStatistics, ScalarValue};
-    use datafusion_expr::Operator;
+    use arrow::datatypes::{Field, Schema, UnionFields, UnionMode};
+    use datafusion_common::ScalarValue;
 
     #[tokio::test]
     async fn collect_columns_predicates() -> Result<()> {
@@ -478,7 +928,7 @@ mod tests {
             &schema,
         )?;
 
-        let (equal_pairs, ne_pairs) = collect_columns_from_predicate(&predicate);
+        let (equal_pairs, ne_pairs) = collect_columns_from_predicate_inner(&predicate);
         assert_eq!(2, equal_pairs.len());
         assert!(equal_pairs[0].0.eq(&col("c2", &schema)?));
         assert!(equal_pairs[0].1.eq(&lit(4u32)));
@@ -520,7 +970,7 @@ mod tests {
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
 
-        let statistics = filter.statistics()?;
+        let statistics = filter.partition_statistics(None)?;
         assert_eq!(statistics.num_rows, Precision::Inexact(25));
         assert_eq!(
             statistics.total_byte_size,
@@ -570,7 +1020,7 @@ mod tests {
             sub_filter,
         )?);
 
-        let statistics = filter.statistics()?;
+        let statistics = filter.partition_statistics(None)?;
         assert_eq!(statistics.num_rows, Precision::Inexact(16));
         assert_eq!(
             statistics.column_statistics,
@@ -630,7 +1080,7 @@ mod tests {
             binary(col("a", &schema)?, Operator::GtEq, lit(10i32), &schema)?,
             b_gt_5,
         )?);
-        let statistics = filter.statistics()?;
+        let statistics = filter.partition_statistics(None)?;
         // On a uniform distribution, only fifteen rows will satisfy the
         // filter that 'a' proposed (a >= 10 AND a <= 25) (15/100) and only
         // 5 rows will satisfy the filter that 'b' proposed (b > 45) (5/50).
@@ -675,7 +1125,7 @@ mod tests {
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
 
-        let statistics = filter.statistics()?;
+        let statistics = filter.partition_statistics(None)?;
         assert_eq!(statistics.num_rows, Precision::Absent);
 
         Ok(())
@@ -748,7 +1198,7 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.statistics()?;
+        let statistics = filter.partition_statistics(None)?;
         // 0.5 (from a) * 0.333333... (from b) * 0.798387... (from c) ≈ 0.1330...
         // num_rows after ceil => 133.0... => 134
         // total_byte_size after ceil => 532.0... => 533
@@ -844,10 +1294,10 @@ mod tests {
             )),
         ));
         // Since filter predicate passes all entries, statistics after filter shouldn't change.
-        let expected = input.statistics()?.column_statistics;
+        let expected = input.partition_statistics(None)?.column_statistics;
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.statistics()?;
+        let statistics = filter.partition_statistics(None)?;
 
         assert_eq!(statistics.num_rows, Precision::Inexact(1000));
         assert_eq!(statistics.total_byte_size, Precision::Inexact(4000));
@@ -900,7 +1350,7 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.statistics()?;
+        let statistics = filter.partition_statistics(None)?;
 
         assert_eq!(statistics.num_rows, Precision::Inexact(0));
         assert_eq!(statistics.total_byte_size, Precision::Inexact(0));
@@ -908,14 +1358,20 @@ mod tests {
             statistics.column_statistics,
             vec![
                 ColumnStatistics {
-                    min_value: Precision::Inexact(ScalarValue::Int32(Some(1))),
-                    max_value: Precision::Inexact(ScalarValue::Int32(Some(100))),
-                    ..Default::default()
+                    min_value: Precision::Exact(ScalarValue::Null),
+                    max_value: Precision::Exact(ScalarValue::Null),
+                    sum_value: Precision::Exact(ScalarValue::Null),
+                    distinct_count: Precision::Exact(0),
+                    null_count: Precision::Exact(0),
+                    byte_size: Precision::Absent,
                 },
                 ColumnStatistics {
-                    min_value: Precision::Inexact(ScalarValue::Int32(Some(1))),
-                    max_value: Precision::Inexact(ScalarValue::Int32(Some(3))),
-                    ..Default::default()
+                    min_value: Precision::Exact(ScalarValue::Null),
+                    max_value: Precision::Exact(ScalarValue::Null),
+                    sum_value: Precision::Exact(ScalarValue::Null),
+                    distinct_count: Precision::Exact(0),
+                    null_count: Precision::Exact(0),
+                    byte_size: Precision::Absent,
                 },
             ]
         );
@@ -956,7 +1412,7 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.statistics()?;
+        let statistics = filter.partition_statistics(None)?;
 
         assert_eq!(statistics.num_rows, Precision::Inexact(490));
         assert_eq!(statistics.total_byte_size, Precision::Inexact(1960));
@@ -1006,7 +1462,7 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let filter_statistics = filter.statistics()?;
+        let filter_statistics = filter.partition_statistics(None)?;
 
         let expected_filter_statistics = Statistics {
             num_rows: Precision::Absent,
@@ -1015,7 +1471,9 @@ mod tests {
                 null_count: Precision::Absent,
                 min_value: Precision::Inexact(ScalarValue::Int32(Some(5))),
                 max_value: Precision::Inexact(ScalarValue::Int32(Some(10))),
+                sum_value: Precision::Absent,
                 distinct_count: Precision::Absent,
+                byte_size: Precision::Absent,
             }],
         };
 
@@ -1039,7 +1497,7 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let filter_statistics = filter.statistics()?;
+        let filter_statistics = filter.partition_statistics(None)?;
         // First column is "a", and it is a column with only one value after the filter.
         assert!(filter_statistics.column_statistics[0].is_singleton());
 
@@ -1086,11 +1544,11 @@ mod tests {
             Arc::new(Literal::new(ScalarValue::Decimal128(Some(10), 10, 10))),
         ));
         let filter = FilterExec::try_new(predicate, input)?;
-        let statistics = filter.statistics()?;
+        let statistics = filter.partition_statistics(None)?;
         assert_eq!(statistics.num_rows, Precision::Inexact(200));
         assert_eq!(statistics.total_byte_size, Precision::Inexact(800));
         let filter = filter.with_default_selectivity(40)?;
-        let statistics = filter.statistics()?;
+        let statistics = filter.partition_statistics(None)?;
         assert_eq!(statistics.num_rows, Precision::Inexact(400));
         assert_eq!(statistics.total_byte_size, Precision::Inexact(1600));
         Ok(())
@@ -1121,10 +1579,10 @@ mod tests {
                 binary(col("c1", &schema)?, Operator::LtEq, lit(4i32), &schema)?,
                 &schema,
             )?,
-            Arc::new(EmptyExec::new(schema.clone())),
+            Arc::new(EmptyExec::new(Arc::clone(&schema))),
         )?;
 
-        exec.statistics().unwrap();
+        exec.partition_statistics(None).unwrap();
 
         Ok(())
     }

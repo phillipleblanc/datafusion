@@ -17,24 +17,19 @@
 
 //! A `Map<K, V>` / `PriorityQueue` combo that evicts the worst values after reaching `capacity`
 
-use crate::aggregates::topk::hash_table::{new_hash_table, ArrowHashTable};
-use crate::aggregates::topk::heap::{new_heap, ArrowHeap};
-use arrow_array::ArrayRef;
-use arrow_schema::DataType;
+use crate::aggregates::topk::hash_table::{ArrowHashTable, new_hash_table};
+use crate::aggregates::topk::heap::{ArrowHeap, new_heap};
+use arrow::array::ArrayRef;
+use arrow::datatypes::DataType;
 use datafusion_common::Result;
 
 /// A `Map<K, V>` / `PriorityQueue` combo that evicts the worst values after reaching `capacity`
 pub struct PriorityMap {
-    map: Box<dyn ArrowHashTable>,
-    heap: Box<dyn ArrowHeap>,
+    map: Box<dyn ArrowHashTable + Send>,
+    heap: Box<dyn ArrowHeap + Send>,
     capacity: usize,
     mapper: Vec<(usize, usize)>,
 }
-
-// JUSTIFICATION
-//  Benefit:  ~15% speedup + required to index into RawTable from binary heap
-//  Soundness: it is only accessed by one thread at a time, and indexes are kept up to date
-unsafe impl Send for PriorityMap {}
 
 impl PriorityMap {
     pub fn new(
@@ -113,13 +108,67 @@ impl PriorityMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{
+        Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray,
+    };
+    use arrow::datatypes::{Field, Schema, SchemaRef};
     use arrow::util::pretty::pretty_format_batches;
-    use arrow_array::{Int64Array, RecordBatch, StringArray};
-    use arrow_schema::Field;
-    use arrow_schema::Schema;
-    use arrow_schema::{DataType, SchemaRef};
-    use datafusion_common::Result;
+    use insta::assert_snapshot;
     use std::sync::Arc;
+
+    #[test]
+    fn should_append_with_utf8view() -> Result<()> {
+        let ids: ArrayRef = Arc::new(StringViewArray::from(vec!["1"]));
+        let vals: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let mut agg = PriorityMap::new(DataType::Utf8View, DataType::Int64, 1, false)?;
+        agg.set_batch(ids, vals);
+        agg.insert(0)?;
+
+        let cols = agg.emit()?;
+        let batch = RecordBatch::try_new(test_schema_utf8view(), cols)?;
+        let batch_schema = batch.schema();
+        assert_eq!(batch_schema.fields[0].data_type(), &DataType::Utf8View);
+
+        let actual = format!("{}", pretty_format_batches(&[batch])?);
+        let expected = r#"
++----------+--------------+
+| trace_id | timestamp_ms |
++----------+--------------+
+| 1        | 1            |
++----------+--------------+
+        "#
+        .trim();
+        assert_eq!(actual, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_append_with_large_utf8() -> Result<()> {
+        let ids: ArrayRef = Arc::new(LargeStringArray::from(vec!["1"]));
+        let vals: ArrayRef = Arc::new(Int64Array::from(vec![1]));
+        let mut agg = PriorityMap::new(DataType::LargeUtf8, DataType::Int64, 1, false)?;
+        agg.set_batch(ids, vals);
+        agg.insert(0)?;
+
+        let cols = agg.emit()?;
+        let batch = RecordBatch::try_new(test_large_schema(), cols)?;
+        let batch_schema = batch.schema();
+        assert_eq!(batch_schema.fields[0].data_type(), &DataType::LargeUtf8);
+
+        let actual = format!("{}", pretty_format_batches(&[batch])?);
+        let expected = r#"
++----------+--------------+
+| trace_id | timestamp_ms |
++----------+--------------+
+| 1        | 1            |
++----------+--------------+
+        "#
+        .trim();
+        assert_eq!(actual, expected);
+
+        Ok(())
+    }
 
     #[test]
     fn should_append() -> Result<()> {
@@ -132,15 +181,15 @@ mod tests {
         let cols = agg.emit()?;
         let batch = RecordBatch::try_new(test_schema(), cols)?;
         let actual = format!("{}", pretty_format_batches(&[batch])?);
-        let expected = r#"
+
+        assert_snapshot!(actual, @r#"
 +----------+--------------+
 | trace_id | timestamp_ms |
 +----------+--------------+
 | 1        | 1            |
 +----------+--------------+
         "#
-        .trim();
-        assert_eq!(actual, expected);
+        );
 
         Ok(())
     }
@@ -157,15 +206,15 @@ mod tests {
         let cols = agg.emit()?;
         let batch = RecordBatch::try_new(test_schema(), cols)?;
         let actual = format!("{}", pretty_format_batches(&[batch])?);
-        let expected = r#"
+
+        assert_snapshot!(actual, @r#"
 +----------+--------------+
 | trace_id | timestamp_ms |
 +----------+--------------+
 | 1        | 1            |
 +----------+--------------+
         "#
-        .trim();
-        assert_eq!(actual, expected);
+        );
 
         Ok(())
     }
@@ -182,15 +231,14 @@ mod tests {
         let cols = agg.emit()?;
         let batch = RecordBatch::try_new(test_schema(), cols)?;
         let actual = format!("{}", pretty_format_batches(&[batch])?);
-        let expected = r#"
+        assert_snapshot!(actual, @r#"
 +----------+--------------+
 | trace_id | timestamp_ms |
 +----------+--------------+
 | 2        | 2            |
 +----------+--------------+
         "#
-        .trim();
-        assert_eq!(actual, expected);
+        );
 
         Ok(())
     }
@@ -207,15 +255,14 @@ mod tests {
         let cols = agg.emit()?;
         let batch = RecordBatch::try_new(test_schema(), cols)?;
         let actual = format!("{}", pretty_format_batches(&[batch])?);
-        let expected = r#"
+        assert_snapshot!(actual, @r#"
 +----------+--------------+
 | trace_id | timestamp_ms |
 +----------+--------------+
 | 1        | 1            |
 +----------+--------------+
         "#
-        .trim();
-        assert_eq!(actual, expected);
+        );
 
         Ok(())
     }
@@ -232,15 +279,14 @@ mod tests {
         let cols = agg.emit()?;
         let batch = RecordBatch::try_new(test_schema(), cols)?;
         let actual = format!("{}", pretty_format_batches(&[batch])?);
-        let expected = r#"
+        assert_snapshot!(actual, @r#"
 +----------+--------------+
 | trace_id | timestamp_ms |
 +----------+--------------+
 | 1        | 2            |
 +----------+--------------+
         "#
-        .trim();
-        assert_eq!(actual, expected);
+        );
 
         Ok(())
     }
@@ -257,15 +303,14 @@ mod tests {
         let cols = agg.emit()?;
         let batch = RecordBatch::try_new(test_schema(), cols)?;
         let actual = format!("{}", pretty_format_batches(&[batch])?);
-        let expected = r#"
+        assert_snapshot!(actual, @r#"
 +----------+--------------+
 | trace_id | timestamp_ms |
 +----------+--------------+
 | 1        | 1            |
 +----------+--------------+
         "#
-        .trim();
-        assert_eq!(actual, expected);
+        );
 
         Ok(())
     }
@@ -282,15 +327,14 @@ mod tests {
         let cols = agg.emit()?;
         let batch = RecordBatch::try_new(test_schema(), cols)?;
         let actual = format!("{}", pretty_format_batches(&[batch])?);
-        let expected = r#"
+        assert_snapshot!(actual, @r#"
 +----------+--------------+
 | trace_id | timestamp_ms |
 +----------+--------------+
 | 2        | 2            |
 +----------+--------------+
         "#
-        .trim();
-        assert_eq!(actual, expected);
+        );
 
         Ok(())
     }
@@ -307,15 +351,14 @@ mod tests {
         let cols = agg.emit()?;
         let batch = RecordBatch::try_new(test_schema(), cols)?;
         let actual = format!("{}", pretty_format_batches(&[batch])?);
-        let expected = r#"
+        assert_snapshot!(actual, @r#"
 +----------+--------------+
 | trace_id | timestamp_ms |
 +----------+--------------+
 | 1        | 1            |
 +----------+--------------+
         "#
-        .trim();
-        assert_eq!(actual, expected);
+        );
 
         Ok(())
     }
@@ -332,15 +375,14 @@ mod tests {
         let cols = agg.emit()?;
         let batch = RecordBatch::try_new(test_schema(), cols)?;
         let actual = format!("{}", pretty_format_batches(&[batch])?);
-        let expected = r#"
+        assert_snapshot!(actual, @r#"
 +----------+--------------+
 | trace_id | timestamp_ms |
 +----------+--------------+
 | 1        | 2            |
 +----------+--------------+
         "#
-        .trim();
-        assert_eq!(actual, expected);
+        );
 
         Ok(())
     }
@@ -358,7 +400,7 @@ mod tests {
         let cols = agg.emit()?;
         let batch = RecordBatch::try_new(test_schema(), cols)?;
         let actual = format!("{}", pretty_format_batches(&[batch])?);
-        let expected = r#"
+        assert_snapshot!(actual, @r#"
 +----------+--------------+
 | trace_id | timestamp_ms |
 +----------+--------------+
@@ -366,8 +408,7 @@ mod tests {
 | 1        | 1            |
 +----------+--------------+
         "#
-        .trim();
-        assert_eq!(actual, expected);
+        );
 
         Ok(())
     }
@@ -375,6 +416,20 @@ mod tests {
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new("trace_id", DataType::Utf8, true),
+            Field::new("timestamp_ms", DataType::Int64, true),
+        ]))
+    }
+
+    fn test_schema_utf8view() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::Utf8View, true),
+            Field::new("timestamp_ms", DataType::Int64, true),
+        ]))
+    }
+
+    fn test_large_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::LargeUtf8, true),
             Field::new("timestamp_ms", DataType::Int64, true),
         ]))
     }

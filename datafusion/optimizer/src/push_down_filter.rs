@@ -1,3 +1,6 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
 // to you under the Apache License, Version 2.0 (the
 // "License"); you may not use this file except in compliance
@@ -17,29 +20,31 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::optimizer::ApplyOrder;
-use crate::utils::is_volatile_expression;
-use crate::{OptimizerConfig, OptimizerRule};
+use arrow::datatypes::DataType;
+use indexmap::IndexSet;
+use itertools::Itertools;
 
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
 use datafusion_common::{
-    internal_err, plan_datafusion_err, qualified_name, Column, DFSchema, DFSchemaRef,
-    JoinConstraint, Result,
+    Column, DFSchema, Result, assert_eq_or_internal_err, assert_or_internal_err,
+    internal_err, plan_err, qualified_name,
 };
-use datafusion_expr::expr::Alias;
+use datafusion_expr::expr::WindowFunction;
 use datafusion_expr::expr_rewriter::replace_col;
-use datafusion_expr::logical_plan::{
-    CrossJoin, Join, JoinType, LogicalPlan, TableScan, Union,
+use datafusion_expr::logical_plan::{Join, JoinType, LogicalPlan, TableScan, Union};
+use datafusion_expr::utils::{
+    conjunction, expr_to_columns, split_conjunction, split_conjunction_owned,
 };
-use datafusion_expr::utils::{conjunction, split_conjunction, split_conjunction_owned};
 use datafusion_expr::{
-    and, build_join_schema, or, BinaryExpr, Expr, Filter, LogicalPlanBuilder, Operator,
-    ScalarFunctionDefinition, TableProviderFilterPushDown,
+    BinaryExpr, Expr, Filter, Operator, Projection, TableProviderFilterPushDown, and, or,
 };
 
-use itertools::Itertools;
+use crate::optimizer::ApplyOrder;
+use crate::simplify_expressions::simplify_predicates;
+use crate::utils::{has_all_column_refs, is_restrict_null_predicate};
+use crate::{OptimizerConfig, OptimizerRule};
 
 /// Optimizer rule for pushing (moving) filter expressions down in a plan so
 /// they are applied as early as possible.
@@ -80,8 +85,8 @@ use itertools::Itertools;
 /// satisfies `filter(op(data)) = op(filter(data))`.
 ///
 /// The filter-commutative property is plan and column-specific. A filter on `a`
-/// can be pushed through a `Aggregate(group_by = [a], agg=[SUM(b))`. However, a
-/// filter on  `SUM(b)` can not be pushed through the same aggregate.
+/// can be pushed through a `Aggregate(group_by = [a], agg=[sum(b))`. However, a
+/// filter on  `sum(b)` can not be pushed through the same aggregate.
 ///
 /// # Handling Conjunctions
 ///
@@ -91,16 +96,16 @@ use itertools::Itertools;
 /// For example, given the following plan:
 ///
 /// ```text
-/// Filter(a > 10 AND SUM(b) < 5)
-///   Aggregate(group_by = [a], agg = [SUM(b))
+/// Filter(a > 10 AND sum(b) < 5)
+///   Aggregate(group_by = [a], agg = [sum(b))
 /// ```
 ///
-/// The `a > 10` is commutative with the `Aggregate` but  `SUM(b) < 5` is not.
+/// The `a > 10` is commutative with the `Aggregate` but  `sum(b) < 5` is not.
 /// Therefore it is possible to only push part of the expression, resulting in:
 ///
 /// ```text
-/// Filter(SUM(b) < 5)
-///   Aggregate(group_by = [a], agg = [SUM(b))
+/// Filter(sum(b) < 5)
+///   Aggregate(group_by = [a], agg = [sum(b))
 ///     Filter(a > 10)
 /// ```
 ///
@@ -128,75 +133,115 @@ use itertools::Itertools;
 /// reaches a plan node that does not commute with that filter, it adds the
 /// filter to that place. When it passes through a projection, it re-writes the
 /// filter's expression taking into account that projection.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct PushDownFilter {}
 
-// For a given JOIN logical plan, determine whether each side of the join is preserved.
-// We say a join side is preserved if the join returns all or a subset of the rows from
-// the relevant side, such that each row of the output table directly maps to a row of
-// the preserved input table. If a table is not preserved, it can provide extra null rows.
-// That is, there may be rows in the output table that don't directly map to a row in the
-// input table.
-//
-// For example:
-//   - In an inner join, both sides are preserved, because each row of the output
-//     maps directly to a row from each side.
-//   - In a left join, the left side is preserved and the right is not, because
-//     there may be rows in the output that don't directly map to a row in the
-//     right input (due to nulls filling where there is no match on the right).
-//
-// This is important because we can always push down post-join filters to a preserved
-// side of the join, assuming the filter only references columns from that side. For the
-// non-preserved side it can be more tricky.
-//
-// Returns a tuple of booleans - (left_preserved, right_preserved).
-fn lr_is_preserved(plan: &LogicalPlan) -> Result<(bool, bool)> {
-    match plan {
-        LogicalPlan::Join(Join { join_type, .. }) => match join_type {
-            JoinType::Inner => Ok((true, true)),
-            JoinType::Left => Ok((true, false)),
-            JoinType::Right => Ok((false, true)),
-            JoinType::Full => Ok((false, false)),
-            // No columns from the right side of the join can be referenced in output
-            // predicates for semi/anti joins, so whether we specify t/f doesn't matter.
-            JoinType::LeftSemi | JoinType::LeftAnti => Ok((true, false)),
-            // No columns from the left side of the join can be referenced in output
-            // predicates for semi/anti joins, so whether we specify t/f doesn't matter.
-            JoinType::RightSemi | JoinType::RightAnti => Ok((false, true)),
-        },
-        LogicalPlan::CrossJoin(_) => Ok((true, true)),
-        _ => internal_err!("lr_is_preserved only valid for JOIN nodes"),
+/// For a given JOIN type, determine whether each input of the join is preserved
+/// for post-join (`WHERE` clause) filters.
+///
+/// It is only correct to push filters below a join for preserved inputs.
+///
+/// # Return Value
+/// A tuple of booleans - (left_preserved, right_preserved).
+///
+/// # "Preserved" input definition
+///
+/// We say a join side is preserved if the join returns all or a subset of the rows from
+/// the relevant side, such that each row of the output table directly maps to a row of
+/// the preserved input table. If a table is not preserved, it can provide extra null rows.
+/// That is, there may be rows in the output table that don't directly map to a row in the
+/// input table.
+///
+/// For example:
+///   - In an inner join, both sides are preserved, because each row of the output
+///     maps directly to a row from each side.
+///
+///   - In a left join, the left side is preserved (we can push predicates) but
+///     the right is not, because there may be rows in the output that don't
+///     directly map to a row in the right input (due to nulls filling where there
+///     is no match on the right).
+pub(crate) fn lr_is_preserved(join_type: JoinType) -> (bool, bool) {
+    match join_type {
+        JoinType::Inner => (true, true),
+        JoinType::Left => (true, false),
+        JoinType::Right => (false, true),
+        JoinType::Full => (false, false),
+        // No columns from the right side of the join can be referenced in output
+        // predicates for semi/anti joins, so whether we specify t/f doesn't matter.
+        JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => (true, false),
+        // No columns from the left side of the join can be referenced in output
+        // predicates for semi/anti joins, so whether we specify t/f doesn't matter.
+        JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark => (false, true),
     }
 }
 
-// For a given JOIN logical plan, determine whether each side of the join is preserved
-// in terms on join filtering.
-// Predicates from join filter can only be pushed to preserved join side.
-fn on_lr_is_preserved(plan: &LogicalPlan) -> Result<(bool, bool)> {
-    match plan {
-        LogicalPlan::Join(Join { join_type, .. }) => match join_type {
-            JoinType::Inner => Ok((true, true)),
-            JoinType::Left => Ok((false, true)),
-            JoinType::Right => Ok((true, false)),
-            JoinType::Full => Ok((false, false)),
-            JoinType::LeftSemi | JoinType::RightSemi => Ok((true, true)),
-            JoinType::LeftAnti => Ok((false, true)),
-            JoinType::RightAnti => Ok((true, false)),
-        },
-        LogicalPlan::CrossJoin(_) => {
-            internal_err!("on_lr_is_preserved cannot be applied to CROSSJOIN nodes")
+/// For a given JOIN type, determine whether each input of the join is preserved
+/// for the join condition (`ON` clause filters).
+///
+/// It is only correct to push filters below a join for preserved inputs.
+///
+/// # Return Value
+/// A tuple of booleans - (left_preserved, right_preserved).
+///
+/// See [`lr_is_preserved`] for a definition of "preserved".
+pub(crate) fn on_lr_is_preserved(join_type: JoinType) -> (bool, bool) {
+    match join_type {
+        JoinType::Inner => (true, true),
+        JoinType::Left => (false, true),
+        JoinType::Right => (true, false),
+        JoinType::Full => (false, false),
+        JoinType::LeftSemi | JoinType::RightSemi => (true, true),
+        JoinType::LeftAnti => (false, true),
+        JoinType::RightAnti => (true, false),
+        JoinType::LeftMark => (false, true),
+        JoinType::RightMark => (true, false),
+    }
+}
+
+/// Evaluates the columns referenced in the given expression to see if they refer
+/// only to the left or right columns
+#[derive(Debug)]
+struct ColumnChecker<'a> {
+    /// schema of left join input
+    left_schema: &'a DFSchema,
+    /// columns in left_schema, computed on demand
+    left_columns: Option<HashSet<Column>>,
+    /// schema of right join input
+    right_schema: &'a DFSchema,
+    /// columns in left_schema, computed on demand
+    right_columns: Option<HashSet<Column>>,
+}
+
+impl<'a> ColumnChecker<'a> {
+    fn new(left_schema: &'a DFSchema, right_schema: &'a DFSchema) -> Self {
+        Self {
+            left_schema,
+            left_columns: None,
+            right_schema,
+            right_columns: None,
         }
-        _ => internal_err!("on_lr_is_preserved only valid for JOIN nodes"),
+    }
+
+    /// Return true if the expression references only columns from the left side of the join
+    fn is_left_only(&mut self, predicate: &Expr) -> bool {
+        if self.left_columns.is_none() {
+            self.left_columns = Some(schema_columns(self.left_schema));
+        }
+        has_all_column_refs(predicate, self.left_columns.as_ref().unwrap())
+    }
+
+    /// Return true if the expression references only columns from the right side of the join
+    fn is_right_only(&mut self, predicate: &Expr) -> bool {
+        if self.right_columns.is_none() {
+            self.right_columns = Some(schema_columns(self.right_schema));
+        }
+        has_all_column_refs(predicate, self.right_columns.as_ref().unwrap())
     }
 }
 
-// Determine which predicates in state can be pushed down to a given side of a join.
-// To determine this, we need to know the schema of the relevant join side and whether
-// or not the side's rows are preserved when joining. If the side is not preserved, we
-// do not push down anything. Otherwise we can push down predicates where all of the
-// relevant columns are contained on the relevant join side's schema.
-fn can_pushdown_join_predicate(predicate: &Expr, schema: &DFSchema) -> Result<bool> {
-    let schema_columns = schema
+/// Returns all columns in the schema
+fn schema_columns(schema: &DFSchema) -> HashSet<Column> {
+    schema
         .iter()
         .flat_map(|(qualifier, field)| {
             [
@@ -205,33 +250,22 @@ fn can_pushdown_join_predicate(predicate: &Expr, schema: &DFSchema) -> Result<bo
                 Column::new_unqualified(field.name()),
             ]
         })
-        .collect::<HashSet<_>>();
-    let columns = predicate.to_columns()?;
-
-    Ok(schema_columns
-        .intersection(&columns)
         .collect::<HashSet<_>>()
-        .len()
-        == columns.len())
 }
 
-// Determine whether the predicate can evaluate as the join conditions
+/// Determine whether the predicate can evaluate as the join conditions
 fn can_evaluate_as_join_condition(predicate: &Expr) -> Result<bool> {
     let mut is_evaluate = true;
-    predicate.apply(&mut |expr| match expr {
+    predicate.apply(|expr| match expr {
         Expr::Column(_)
-        | Expr::Literal(_)
+        | Expr::Literal(_, _)
         | Expr::Placeholder(_)
         | Expr::ScalarVariable(_, _) => Ok(TreeNodeRecursion::Jump),
         Expr::Exists { .. }
         | Expr::InSubquery(_)
         | Expr::ScalarSubquery(_)
         | Expr::OuterReferenceColumn(_, _)
-        | Expr::Unnest(_)
-        | Expr::ScalarFunction(datafusion_expr::expr::ScalarFunction {
-            func_def: ScalarFunctionDefinition::UDF(_),
-            ..
-        }) => {
+        | Expr::Unnest(_) => {
             is_evaluate = false;
             Ok(TreeNodeRecursion::Stop)
         }
@@ -249,15 +283,15 @@ fn can_evaluate_as_join_condition(predicate: &Expr) -> Result<bool> {
         | Expr::IsNotFalse(_)
         | Expr::IsNotUnknown(_)
         | Expr::Negative(_)
-        | Expr::GetIndexedField(_)
         | Expr::Between(_)
         | Expr::Case(_)
         | Expr::Cast(_)
         | Expr::TryCast(_)
-        | Expr::ScalarFunction(..)
-        | Expr::InList { .. } => Ok(TreeNodeRecursion::Continue),
-        Expr::Sort(_)
-        | Expr::AggregateFunction(_)
+        | Expr::InList { .. }
+        | Expr::ScalarFunction(_) => Ok(TreeNodeRecursion::Continue),
+        // TODO: remove the next line after `Expr::Wildcard` is removed
+        #[expect(deprecated)]
+        Expr::AggregateFunction(_)
         | Expr::WindowFunction(_)
         | Expr::Wildcard { .. }
         | Expr::GroupingSet(_) => internal_err!("Unsupported predicate type"),
@@ -265,53 +299,44 @@ fn can_evaluate_as_join_condition(predicate: &Expr) -> Result<bool> {
     Ok(is_evaluate)
 }
 
-// examine OR clause to see if any useful clauses can be extracted and push down.
-// extract at least one qual from each sub clauses of OR clause, then form the quals
-// to new OR clause as predicate.
-//
-// Filter: (a = c and a < 20) or (b = d and b > 10)
-//     join/crossjoin:
-//          TableScan: projection=[a, b]
-//          TableScan: projection=[c, d]
-//
-// is optimized to
-//
-// Filter: (a = c and a < 20) or (b = d and b > 10)
-//     join/crossjoin:
-//          Filter: (a < 20) or (b > 10)
-//              TableScan: projection=[a, b]
-//          TableScan: projection=[c, d]
-//
-// In general, predicates of this form:
-//
-// (A AND B) OR (C AND D)
-//
-// will be transformed to
-//
-// ((A AND B) OR (C AND D)) AND (A OR C)
-//
-// OR
-//
-// ((A AND B) OR (C AND D)) AND ((A AND B) OR C)
-//
-// OR
-//
-// do nothing.
-//
+/// examine OR clause to see if any useful clauses can be extracted and push down.
+/// extract at least one qual from each sub clauses of OR clause, then form the quals
+/// to new OR clause as predicate.
+///
+/// # Example
+/// ```text
+/// Filter: (a = c and a < 20) or (b = d and b > 10)
+///     join/crossjoin:
+///          TableScan: projection=[a, b]
+///          TableScan: projection=[c, d]
+/// ```
+///
+/// is optimized to
+///
+/// ```text
+/// Filter: (a = c and a < 20) or (b = d and b > 10)
+///     join/crossjoin:
+///          Filter: (a < 20) or (b > 10)
+///              TableScan: projection=[a, b]
+///          TableScan: projection=[c, d]
+/// ```
+///
+/// In general, predicates of this form:
+///
+/// ```sql
+/// (A AND B) OR (C AND D)
+/// ```
+///
+/// will be transformed to one of:
+///
+/// * `((A AND B) OR (C AND D)) AND (A OR C)`
+/// * `((A AND B) OR (C AND D)) AND ((A AND B) OR C)`
+/// * do nothing.
 fn extract_or_clauses_for_join<'a>(
     filters: &'a [Expr],
     schema: &'a DFSchema,
 ) -> impl Iterator<Item = Expr> + 'a {
-    let schema_columns = schema
-        .iter()
-        .flat_map(|(qualifier, field)| {
-            [
-                Column::new(qualifier.cloned(), field.name()),
-                // we need to push down filter using unqualified column as well
-                Column::new_unqualified(field.name()),
-            ]
-        })
-        .collect::<HashSet<_>>();
+    let schema_columns = schema_columns(schema);
 
     // new formed OR clauses and their column references
     filters.iter().filter_map(move |expr| {
@@ -333,17 +358,17 @@ fn extract_or_clauses_for_join<'a>(
     })
 }
 
-// extract qual from OR sub-clause.
-//
-// A qual is extracted if it only contains set of column references in schema_columns.
-//
-// For AND clause, we extract from both sub-clauses, then make new AND clause by extracted
-// clauses if both extracted; Otherwise, use the extracted clause from any sub-clauses or None.
-//
-// For OR clause, we extract from both sub-clauses, then make new OR clause by extracted clauses if both extracted;
-// Otherwise, return None.
-//
-// For other clause, apply the rule above to extract clause.
+/// extract qual from OR sub-clause.
+///
+/// A qual is extracted if it only contains set of column references in schema_columns.
+///
+/// For AND clause, we extract from both sub-clauses, then make new AND clause by extracted
+/// clauses if both extracted; Otherwise, use the extracted clause from any sub-clauses or None.
+///
+/// For OR clause, we extract from both sub-clauses, then make new OR clause by extracted clauses if both extracted;
+/// Otherwise, return None.
+///
+/// For other clause, apply the rule above to extract clause.
 fn extract_or_clause(expr: &Expr, schema_columns: &HashSet<Column>) -> Option<Expr> {
     let mut predicate = None;
 
@@ -384,14 +409,7 @@ fn extract_or_clause(expr: &Expr, schema_columns: &HashSet<Column>) -> Option<Ex
             }
         }
         _ => {
-            let columns = expr.to_columns().ok().unwrap();
-
-            if schema_columns
-                .intersection(&columns)
-                .collect::<HashSet<_>>()
-                .len()
-                == columns.len()
-            {
+            if has_all_column_refs(expr, schema_columns) {
                 predicate = Some(expr.clone());
             }
         }
@@ -400,36 +418,32 @@ fn extract_or_clause(expr: &Expr, schema_columns: &HashSet<Column>) -> Option<Ex
     predicate
 }
 
-// push down join/cross-join
+/// push down join/cross-join
 fn push_down_all_join(
     predicates: Vec<Expr>,
-    infer_predicates: Vec<Expr>,
-    join_plan: &LogicalPlan,
-    left: &LogicalPlan,
-    right: &LogicalPlan,
+    inferred_join_predicates: Vec<Expr>,
+    mut join: Join,
     on_filter: Vec<Expr>,
-    is_inner_join: bool,
-) -> Result<LogicalPlan> {
-    let on_filter_empty = on_filter.is_empty();
+) -> Result<Transformed<LogicalPlan>> {
+    let is_inner_join = join.join_type == JoinType::Inner;
     // Get pushable predicates from current optimizer state
-    let (left_preserved, right_preserved) = lr_is_preserved(join_plan)?;
+    let (left_preserved, right_preserved) = lr_is_preserved(join.join_type);
 
     // The predicates can be divided to three categories:
     // 1) can push through join to its children(left or right)
     // 2) can be converted to join conditions if the join type is Inner
     // 3) should be kept as filter conditions
-    let left_schema = left.schema();
-    let right_schema = right.schema();
+    let left_schema = join.left.schema();
+    let right_schema = join.right.schema();
     let mut left_push = vec![];
     let mut right_push = vec![];
     let mut keep_predicates = vec![];
     let mut join_conditions = vec![];
+    let mut checker = ColumnChecker::new(left_schema, right_schema);
     for predicate in predicates {
-        if left_preserved && can_pushdown_join_predicate(&predicate, left_schema)? {
+        if left_preserved && checker.is_left_only(&predicate) {
             left_push.push(predicate);
-        } else if right_preserved
-            && can_pushdown_join_predicate(&predicate, right_schema)?
-        {
+        } else if right_preserved && checker.is_right_only(&predicate) {
             right_push.push(predicate);
         } else if is_inner_join && can_evaluate_as_join_condition(&predicate)? {
             // Here we do not differ it is eq or non-eq predicate, ExtractEquijoinPredicate will extract the eq predicate
@@ -441,27 +455,25 @@ fn push_down_all_join(
     }
 
     // For infer predicates, if they can not push through join, just drop them
-    for predicate in infer_predicates {
-        if left_preserved && can_pushdown_join_predicate(&predicate, left_schema)? {
+    for predicate in inferred_join_predicates {
+        if left_preserved && checker.is_left_only(&predicate) {
             left_push.push(predicate);
-        } else if right_preserved
-            && can_pushdown_join_predicate(&predicate, right_schema)?
-        {
+        } else if right_preserved && checker.is_right_only(&predicate) {
             right_push.push(predicate);
         }
     }
 
+    let mut on_filter_join_conditions = vec![];
+    let (on_left_preserved, on_right_preserved) = on_lr_is_preserved(join.join_type);
+
     if !on_filter.is_empty() {
-        let (on_left_preserved, on_right_preserved) = on_lr_is_preserved(join_plan)?;
         for on in on_filter {
-            if on_left_preserved && can_pushdown_join_predicate(&on, left_schema)? {
+            if on_left_preserved && checker.is_left_only(&on) {
                 left_push.push(on)
-            } else if on_right_preserved
-                && can_pushdown_join_predicate(&on, right_schema)?
-            {
+            } else if on_right_preserved && checker.is_right_only(&on) {
                 right_push.push(on)
             } else {
-                join_conditions.push(on)
+                on_filter_join_conditions.push(on)
             }
         }
     }
@@ -477,138 +489,265 @@ fn push_down_all_join(
         right_push.extend(extract_or_clauses_for_join(&join_conditions, right_schema));
     }
 
-    let left = match conjunction(left_push) {
-        Some(predicate) => {
-            LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(left.clone()))?)
-        }
-        None => left.clone(),
-    };
-    let right = match conjunction(right_push) {
-        Some(predicate) => {
-            LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(right.clone()))?)
-        }
-        None => right.clone(),
-    };
-    // Create a new Join with the new `left` and `right`
-    //
-    // expressions() output for Join is a vector consisting of
-    //   1. join keys - columns mentioned in ON clause
-    //   2. optional predicate - in case join filter is not empty,
-    //      it always will be the last element, otherwise result
-    //      vector will contain only join keys (without additional
-    //      element representing filter).
-    let mut exprs = join_plan.expressions();
-    if !on_filter_empty {
-        exprs.pop();
+    // For predicates from join filter, we should check with if a join side is preserved
+    // in term of join filtering.
+    if on_left_preserved {
+        left_push.extend(extract_or_clauses_for_join(
+            &on_filter_join_conditions,
+            left_schema,
+        ));
     }
-    exprs.extend(join_conditions.into_iter().reduce(Expr::and));
-    let plan = join_plan.with_new_exprs(exprs, vec![left, right])?;
+    if on_right_preserved {
+        right_push.extend(extract_or_clauses_for_join(
+            &on_filter_join_conditions,
+            right_schema,
+        ));
+    }
 
-    // wrap the join on the filter whose predicates must be kept
-    match conjunction(keep_predicates) {
-        Some(predicate) => {
-            Filter::try_new(predicate, Arc::new(plan)).map(LogicalPlan::Filter)
-        }
-        None => Ok(plan),
+    if let Some(predicate) = conjunction(left_push) {
+        join.left = Arc::new(LogicalPlan::Filter(Filter::try_new(predicate, join.left)?));
     }
+    if let Some(predicate) = conjunction(right_push) {
+        join.right =
+            Arc::new(LogicalPlan::Filter(Filter::try_new(predicate, join.right)?));
+    }
+
+    // Add any new join conditions as the non join predicates
+    join_conditions.extend(on_filter_join_conditions);
+    join.filter = conjunction(join_conditions);
+
+    // wrap the join on the filter whose predicates must be kept, if any
+    let plan = LogicalPlan::Join(join);
+    let plan = if let Some(predicate) = conjunction(keep_predicates) {
+        LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(plan))?)
+    } else {
+        plan
+    };
+    Ok(Transformed::yes(plan))
 }
 
 fn push_down_join(
-    plan: &LogicalPlan,
-    join: &Join,
+    join: Join,
     parent_predicate: Option<&Expr>,
-) -> Result<Option<LogicalPlan>> {
-    let predicates = match parent_predicate {
-        Some(parent_predicate) => split_conjunction_owned(parent_predicate.clone()),
-        None => vec![],
-    };
+) -> Result<Transformed<LogicalPlan>> {
+    // Split the parent predicate into individual conjunctive parts.
+    let predicates = parent_predicate
+        .map_or_else(Vec::new, |pred| split_conjunction_owned(pred.clone()));
 
-    // Convert JOIN ON predicate to Predicates
+    // Extract conjunctions from the JOIN's ON filter, if present.
     let on_filters = join
         .filter
         .as_ref()
-        .map(|e| split_conjunction_owned(e.clone()))
-        .unwrap_or_default();
+        .map_or_else(Vec::new, |filter| split_conjunction_owned(filter.clone()));
 
-    let mut is_inner_join = false;
-    let infer_predicates = if join.join_type == JoinType::Inner {
-        is_inner_join = true;
-        // Only allow both side key is column.
-        let join_col_keys = join
-            .on
-            .iter()
-            .flat_map(|(l, r)| match (l.try_into_col(), r.try_into_col()) {
-                (Ok(l_col), Ok(r_col)) => Some((l_col, r_col)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        // TODO refine the logic, introduce EquivalenceProperties to logical plan and infer additional filters to push down
-        // For inner joins, duplicate filters for joined columns so filters can be pushed down
-        // to both sides. Take the following query as an example:
-        //
-        // ```sql
-        // SELECT * FROM t1 JOIN t2 on t1.id = t2.uid WHERE t1.id > 1
-        // ```
-        //
-        // `t1.id > 1` predicate needs to be pushed down to t1 table scan, while
-        // `t2.uid > 1` predicate needs to be pushed down to t2 table scan.
-        //
-        // Join clauses with `Using` constraints also take advantage of this logic to make sure
-        // predicates reference the shared join columns are pushed to both sides.
-        // This logic should also been applied to conditions in JOIN ON clause
-        predicates
-            .iter()
-            .chain(on_filters.iter())
-            .filter_map(|predicate| {
-                let mut join_cols_to_replace = HashMap::new();
-                let columns = match predicate.to_columns() {
-                    Ok(columns) => columns,
-                    Err(e) => return Some(Err(e)),
-                };
+    // Are there any new join predicates that can be inferred from the filter expressions?
+    let inferred_join_predicates =
+        infer_join_predicates(&join, &predicates, &on_filters)?;
 
-                for col in columns.iter() {
-                    for (l, r) in join_col_keys.iter() {
-                        if col == l {
-                            join_cols_to_replace.insert(col, r);
-                            break;
-                        } else if col == r {
-                            join_cols_to_replace.insert(col, l);
-                            break;
-                        }
-                    }
-                }
-
-                if join_cols_to_replace.is_empty() {
-                    return None;
-                }
-
-                let join_side_predicate =
-                    match replace_col(predicate.clone(), &join_cols_to_replace) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            return Some(Err(e));
-                        }
-                    };
-
-                Some(Ok(join_side_predicate))
-            })
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        vec![]
-    };
-
-    if on_filters.is_empty() && predicates.is_empty() && infer_predicates.is_empty() {
-        return Ok(None);
+    if on_filters.is_empty()
+        && predicates.is_empty()
+        && inferred_join_predicates.is_empty()
+    {
+        return Ok(Transformed::no(LogicalPlan::Join(join)));
     }
-    Ok(Some(push_down_all_join(
+
+    push_down_all_join(predicates, inferred_join_predicates, join, on_filters)
+}
+
+/// Extracts any equi-join join predicates from the given filter expressions.
+///
+/// Parameters
+/// * `join` the join in question
+///
+/// * `predicates` the pushed down filter expression
+///
+/// * `on_filters` filters from the join ON clause that have not already been
+///   identified as join predicates
+fn infer_join_predicates(
+    join: &Join,
+    predicates: &[Expr],
+    on_filters: &[Expr],
+) -> Result<Vec<Expr>> {
+    // Only allow both side key is column.
+    let join_col_keys = join
+        .on
+        .iter()
+        .filter_map(|(l, r)| {
+            let left_col = l.try_as_col()?;
+            let right_col = r.try_as_col()?;
+            Some((left_col, right_col))
+        })
+        .collect::<Vec<_>>();
+
+    let join_type = join.join_type;
+
+    let mut inferred_predicates = InferredPredicates::new(join_type);
+
+    infer_join_predicates_from_predicates(
+        &join_col_keys,
         predicates,
-        infer_predicates,
-        plan,
-        &join.left,
-        &join.right,
+        &mut inferred_predicates,
+    )?;
+
+    infer_join_predicates_from_on_filters(
+        &join_col_keys,
+        join_type,
         on_filters,
-        is_inner_join,
-    )?))
+        &mut inferred_predicates,
+    )?;
+
+    Ok(inferred_predicates.predicates)
+}
+
+/// Inferred predicates collector.
+/// When the JoinType is not Inner, we need to detect whether the inferred predicate can strictly
+/// filter out NULL, otherwise ignore it. e.g.
+/// ```text
+/// SELECT * FROM t1 LEFT JOIN t2 ON t1.c0 = t2.c0 WHERE t2.c0 IS NULL;
+/// ```
+/// We cannot infer the predicate `t1.c0 IS NULL`, otherwise the predicate will be pushed down to
+/// the left side, resulting in the wrong result.
+struct InferredPredicates {
+    predicates: Vec<Expr>,
+    is_inner_join: bool,
+}
+
+impl InferredPredicates {
+    fn new(join_type: JoinType) -> Self {
+        Self {
+            predicates: vec![],
+            is_inner_join: matches!(join_type, JoinType::Inner),
+        }
+    }
+
+    fn try_build_predicate(
+        &mut self,
+        predicate: Expr,
+        replace_map: &HashMap<&Column, &Column>,
+    ) -> Result<()> {
+        if self.is_inner_join
+            || matches!(
+                is_restrict_null_predicate(
+                    predicate.clone(),
+                    replace_map.keys().cloned()
+                ),
+                Ok(true)
+            )
+        {
+            self.predicates.push(replace_col(predicate, replace_map)?);
+        }
+
+        Ok(())
+    }
+}
+
+/// Infer predicates from the pushed down predicates.
+///
+/// Parameters
+/// * `join_col_keys` column pairs from the join ON clause
+///
+/// * `predicates` the pushed down predicates
+///
+/// * `inferred_predicates` the inferred results
+fn infer_join_predicates_from_predicates(
+    join_col_keys: &[(&Column, &Column)],
+    predicates: &[Expr],
+    inferred_predicates: &mut InferredPredicates,
+) -> Result<()> {
+    infer_join_predicates_impl::<true, true>(
+        join_col_keys,
+        predicates,
+        inferred_predicates,
+    )
+}
+
+/// Infer predicates from the join filter.
+///
+/// Parameters
+/// * `join_col_keys` column pairs from the join ON clause
+///
+/// * `join_type` the JoinType of Join
+///
+/// * `on_filters` filters from the join ON clause that have not already been
+///   identified as join predicates
+///
+/// * `inferred_predicates` the inferred results
+fn infer_join_predicates_from_on_filters(
+    join_col_keys: &[(&Column, &Column)],
+    join_type: JoinType,
+    on_filters: &[Expr],
+    inferred_predicates: &mut InferredPredicates,
+) -> Result<()> {
+    match join_type {
+        JoinType::Full | JoinType::LeftAnti | JoinType::RightAnti => Ok(()),
+        JoinType::Inner => infer_join_predicates_impl::<true, true>(
+            join_col_keys,
+            on_filters,
+            inferred_predicates,
+        ),
+        JoinType::Left | JoinType::LeftSemi | JoinType::LeftMark => {
+            infer_join_predicates_impl::<true, false>(
+                join_col_keys,
+                on_filters,
+                inferred_predicates,
+            )
+        }
+        JoinType::Right | JoinType::RightSemi | JoinType::RightMark => {
+            infer_join_predicates_impl::<false, true>(
+                join_col_keys,
+                on_filters,
+                inferred_predicates,
+            )
+        }
+    }
+}
+
+/// Infer predicates from the given predicates.
+///
+/// Parameters
+/// * `join_col_keys` column pairs from the join ON clause
+///
+/// * `input_predicates` the given predicates. It can be the pushed down predicates,
+///   or it can be the filters of the Join
+///
+/// * `inferred_predicates` the inferred results
+///
+/// * `ENABLE_LEFT_TO_RIGHT` indicates that the right table related predicate can
+///   be inferred from the left table related predicate
+///
+/// * `ENABLE_RIGHT_TO_LEFT` indicates that the left table related predicate can
+///   be inferred from the right table related predicate
+fn infer_join_predicates_impl<
+    const ENABLE_LEFT_TO_RIGHT: bool,
+    const ENABLE_RIGHT_TO_LEFT: bool,
+>(
+    join_col_keys: &[(&Column, &Column)],
+    input_predicates: &[Expr],
+    inferred_predicates: &mut InferredPredicates,
+) -> Result<()> {
+    for predicate in input_predicates {
+        let mut join_cols_to_replace = HashMap::new();
+
+        for &col in &predicate.column_refs() {
+            for (l, r) in join_col_keys.iter() {
+                if ENABLE_LEFT_TO_RIGHT && col == *l {
+                    join_cols_to_replace.insert(col, *r);
+                    break;
+                }
+                if ENABLE_RIGHT_TO_LEFT && col == *r {
+                    join_cols_to_replace.insert(col, *l);
+                    break;
+                }
+            }
+        }
+        if join_cols_to_replace.is_empty() {
+            continue;
+        }
+
+        inferred_predicates
+            .try_build_predicate(predicate.clone(), &join_cols_to_replace)?;
+    }
+    Ok(())
 }
 
 impl OptimizerRule for PushDownFilter {
@@ -620,52 +759,78 @@ impl OptimizerRule for PushDownFilter {
         Some(ApplyOrder::TopDown)
     }
 
-    fn try_optimize(
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(
         &self,
-        plan: &LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> Result<Option<LogicalPlan>> {
-        let filter = match plan {
-            LogicalPlan::Filter(filter) => filter,
-            // we also need to pushdown filter in Join.
-            LogicalPlan::Join(join) => return push_down_join(plan, join, None),
-            _ => return Ok(None),
+        plan: LogicalPlan,
+        config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
+        let _ = config.options();
+        if let LogicalPlan::Join(join) = plan {
+            return push_down_join(join, None);
         };
 
-        let child_plan = filter.input.as_ref();
-        let new_plan = match child_plan {
-            LogicalPlan::Filter(child_filter) => {
-                let parents_predicates = split_conjunction(&filter.predicate);
-                let set: HashSet<&&Expr> = parents_predicates.iter().collect();
+        let plan_schema = Arc::clone(plan.schema());
 
+        let LogicalPlan::Filter(mut filter) = plan else {
+            return Ok(Transformed::no(plan));
+        };
+
+        let predicate = split_conjunction_owned(filter.predicate.clone());
+        let old_predicate_len = predicate.len();
+        let new_predicates = simplify_predicates(predicate)?;
+        if old_predicate_len != new_predicates.len() {
+            let Some(new_predicate) = conjunction(new_predicates) else {
+                // new_predicates is empty - remove the filter entirely
+                // Return the child plan without the filter
+                return Ok(Transformed::yes(Arc::unwrap_or_clone(filter.input)));
+            };
+            filter.predicate = new_predicate;
+        }
+
+        match Arc::unwrap_or_clone(filter.input) {
+            LogicalPlan::Filter(child_filter) => {
+                let parents_predicates = split_conjunction_owned(filter.predicate);
+
+                // remove duplicated filters
+                let child_predicates = split_conjunction_owned(child_filter.predicate);
                 let new_predicates = parents_predicates
-                    .iter()
-                    .chain(
-                        split_conjunction(&child_filter.predicate)
-                            .iter()
-                            .filter(|e| !set.contains(e)),
-                    )
-                    .map(|e| (*e).clone())
+                    .into_iter()
+                    .chain(child_predicates)
+                    // use IndexSet to remove dupes while preserving predicate order
+                    .collect::<IndexSet<_>>()
+                    .into_iter()
                     .collect::<Vec<_>>();
-                let new_predicate = conjunction(new_predicates).ok_or_else(|| {
-                    plan_datafusion_err!("at least one expression exists")
-                })?;
+
+                let Some(new_predicate) = conjunction(new_predicates) else {
+                    return plan_err!("at least one expression exists");
+                };
                 let new_filter = LogicalPlan::Filter(Filter::try_new(
                     new_predicate,
-                    child_filter.input.clone(),
+                    child_filter.input,
                 )?);
-                self.try_optimize(&new_filter, _config)?
-                    .unwrap_or(new_filter)
+                self.rewrite(new_filter, config)
             }
-            LogicalPlan::Repartition(_)
-            | LogicalPlan::Distinct(_)
-            | LogicalPlan::Sort(_) => {
-                // commutable
-                let new_filter = plan.with_new_exprs(
-                    plan.expressions(),
-                    vec![child_plan.inputs()[0].clone()],
-                )?;
-                child_plan.with_new_exprs(child_plan.expressions(), vec![new_filter])?
+            LogicalPlan::Repartition(repartition) => {
+                let new_filter =
+                    Filter::try_new(filter.predicate, Arc::clone(&repartition.input))
+                        .map(LogicalPlan::Filter)?;
+                insert_below(LogicalPlan::Repartition(repartition), new_filter)
+            }
+            LogicalPlan::Distinct(distinct) => {
+                let new_filter =
+                    Filter::try_new(filter.predicate, Arc::clone(distinct.input()))
+                        .map(LogicalPlan::Filter)?;
+                insert_below(LogicalPlan::Distinct(distinct), new_filter)
+            }
+            LogicalPlan::Sort(sort) => {
+                let new_filter =
+                    Filter::try_new(filter.predicate, Arc::clone(&sort.input))
+                        .map(LogicalPlan::Filter)?;
+                insert_below(LogicalPlan::Sort(sort), new_filter)
             }
             LogicalPlan::SubqueryAlias(subquery_alias) => {
                 let mut replace_map = HashMap::new();
@@ -679,77 +844,108 @@ impl OptimizerRule for PushDownFilter {
                         Expr::Column(Column::new(qualifier.cloned(), field.name())),
                     );
                 }
-                let new_predicate =
-                    replace_cols_by_name(filter.predicate.clone(), &replace_map)?;
+                let new_predicate = replace_cols_by_name(filter.predicate, &replace_map)?;
+
                 let new_filter = LogicalPlan::Filter(Filter::try_new(
                     new_predicate,
-                    subquery_alias.input.clone(),
+                    Arc::clone(&subquery_alias.input),
                 )?);
-                child_plan.with_new_exprs(child_plan.expressions(), vec![new_filter])?
+                insert_below(LogicalPlan::SubqueryAlias(subquery_alias), new_filter)
             }
             LogicalPlan::Projection(projection) => {
-                // A projection is filter-commutable if it do not contain volatile predicates or contain volatile
-                // predicates that are not used in the filter. However, we should re-writes all predicate expressions.
-                // collect projection.
-                let (volatile_map, non_volatile_map): (HashMap<_, _>, HashMap<_, _>) =
-                    projection
-                        .schema
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (qualifier, field))| {
-                            // strip alias, as they should not be part of filters
-                            let expr = match &projection.expr[i] {
-                                Expr::Alias(Alias { expr, .. }) => expr.as_ref().clone(),
-                                expr => expr.clone(),
-                            };
-
-                            (qualified_name(qualifier, field.name()), expr)
-                        })
-                        .partition(|(_, value)| {
-                            is_volatile_expression(value).unwrap_or(true)
-                        });
-
-                let mut push_predicates = vec![];
-                let mut keep_predicates = vec![];
-                for expr in split_conjunction_owned(filter.predicate.clone()).into_iter()
-                {
-                    if contain(&expr, &volatile_map) {
-                        keep_predicates.push(expr);
-                    } else {
-                        push_predicates.push(expr);
+                let predicates = split_conjunction_owned(filter.predicate.clone());
+                let (new_projection, keep_predicate) =
+                    rewrite_projection(predicates, projection)?;
+                if new_projection.transformed {
+                    match keep_predicate {
+                        None => Ok(new_projection),
+                        Some(keep_predicate) => new_projection.map_data(|child_plan| {
+                            Filter::try_new(keep_predicate, Arc::new(child_plan))
+                                .map(LogicalPlan::Filter)
+                        }),
                     }
-                }
-
-                match conjunction(push_predicates) {
-                    Some(expr) => {
-                        // re-write all filters based on this projection
-                        // E.g. in `Filter: b\n  Projection: a > 1 as b`, we can swap them, but the filter must be "a > 1"
-                        let new_filter = LogicalPlan::Filter(Filter::try_new(
-                            replace_cols_by_name(expr, &non_volatile_map)?,
-                            projection.input.clone(),
-                        )?);
-
-                        match conjunction(keep_predicates) {
-                            None => child_plan.with_new_exprs(
-                                child_plan.expressions(),
-                                vec![new_filter],
-                            )?,
-                            Some(keep_predicate) => {
-                                let child_plan = child_plan.with_new_exprs(
-                                    child_plan.expressions(),
-                                    vec![new_filter],
-                                )?;
-                                LogicalPlan::Filter(Filter::try_new(
-                                    keep_predicate,
-                                    Arc::new(child_plan),
-                                )?)
-                            }
-                        }
-                    }
-                    None => return Ok(None),
+                } else {
+                    filter.input = Arc::new(new_projection.data);
+                    Ok(Transformed::no(LogicalPlan::Filter(filter)))
                 }
             }
-            LogicalPlan::Union(union) => {
+            LogicalPlan::Unnest(mut unnest) => {
+                let predicates = split_conjunction_owned(filter.predicate.clone());
+                let mut non_unnest_predicates = vec![];
+                let mut unnest_predicates = vec![];
+                let mut unnest_struct_columns = vec![];
+
+                for idx in &unnest.struct_type_columns {
+                    let (sub_qualifier, field) =
+                        unnest.input.schema().qualified_field(*idx);
+                    let field_name = field.name().clone();
+
+                    if let DataType::Struct(children) = field.data_type() {
+                        for child in children {
+                            let child_name = child.name().clone();
+                            unnest_struct_columns.push(Column::new(
+                                sub_qualifier.cloned(),
+                                format!("{field_name}.{child_name}"),
+                            ));
+                        }
+                    }
+                }
+
+                for predicate in predicates {
+                    // collect all the Expr::Column in predicate recursively
+                    let mut accum: HashSet<Column> = HashSet::new();
+                    expr_to_columns(&predicate, &mut accum)?;
+
+                    let contains_list_columns =
+                        unnest.list_type_columns.iter().any(|(_, unnest_list)| {
+                            accum.contains(&unnest_list.output_column)
+                        });
+                    let contains_struct_columns =
+                        unnest_struct_columns.iter().any(|c| accum.contains(c));
+
+                    if contains_list_columns || contains_struct_columns {
+                        unnest_predicates.push(predicate);
+                    } else {
+                        non_unnest_predicates.push(predicate);
+                    }
+                }
+
+                // Unnest predicates should not be pushed down.
+                // If no non-unnest predicates exist, early return
+                if non_unnest_predicates.is_empty() {
+                    filter.input = Arc::new(LogicalPlan::Unnest(unnest));
+                    return Ok(Transformed::no(LogicalPlan::Filter(filter)));
+                }
+
+                // Push down non-unnest filter predicate
+                // Unnest
+                //   Unnest Input (Projection)
+                // -> rewritten to
+                // Unnest
+                //   Filter
+                //     Unnest Input (Projection)
+
+                let unnest_input = std::mem::take(&mut unnest.input);
+
+                let filter_with_unnest_input = LogicalPlan::Filter(Filter::try_new(
+                    conjunction(non_unnest_predicates).unwrap(), // Safe to unwrap since non_unnest_predicates is not empty.
+                    unnest_input,
+                )?);
+
+                // Directly assign new filter plan as the new unnest's input.
+                // The new filter plan will go through another rewrite pass since the rule itself
+                // is applied recursively to all the child from top to down
+                let unnest_plan =
+                    insert_below(LogicalPlan::Unnest(unnest), filter_with_unnest_input)?;
+
+                match conjunction(unnest_predicates) {
+                    None => Ok(unnest_plan),
+                    Some(predicate) => Ok(Transformed::yes(LogicalPlan::Filter(
+                        Filter::try_new(predicate, Arc::new(unnest_plan.data))?,
+                    ))),
+                }
+            }
+            LogicalPlan::Union(ref union) => {
                 let mut inputs = Vec::with_capacity(union.inputs.len());
                 for input in &union.inputs {
                     let mut replace_map = HashMap::new();
@@ -766,28 +962,31 @@ impl OptimizerRule for PushDownFilter {
                         replace_cols_by_name(filter.predicate.clone(), &replace_map)?;
                     inputs.push(Arc::new(LogicalPlan::Filter(Filter::try_new(
                         push_predicate,
-                        input.clone(),
+                        Arc::clone(input),
                     )?)))
                 }
-                LogicalPlan::Union(Union {
+                Ok(Transformed::yes(LogicalPlan::Union(Union {
                     inputs,
-                    schema: plan.schema().clone(),
-                })
+                    schema: Arc::clone(&plan_schema),
+                })))
             }
             LogicalPlan::Aggregate(agg) => {
                 // We can push down Predicate which in groupby_expr.
                 let group_expr_columns = agg
                     .group_expr
                     .iter()
-                    .map(|e| Ok(Column::from_qualified_name(e.display_name()?)))
-                    .collect::<Result<HashSet<_>>>()?;
+                    .map(|e| {
+                        let (relation, name) = e.qualified_name();
+                        Column::new(relation, name)
+                    })
+                    .collect::<HashSet<_>>();
 
-                let predicates = split_conjunction_owned(filter.predicate.clone());
+                let predicates = split_conjunction_owned(filter.predicate);
 
                 let mut keep_predicates = vec![];
                 let mut push_predicates = vec![];
                 for expr in predicates {
-                    let cols = expr.to_columns()?;
+                    let cols = expr.column_refs();
                     if cols.iter().all(|c| group_expr_columns.contains(c)) {
                         push_predicates.push(expr);
                     } else {
@@ -800,73 +999,160 @@ impl OptimizerRule for PushDownFilter {
                 // So we need create a replace_map, add {`a+b` --> Expr(Column(a)+Column(b))}
                 let mut replace_map = HashMap::new();
                 for expr in &agg.group_expr {
-                    replace_map.insert(expr.display_name()?, expr.clone());
+                    replace_map.insert(expr.schema_name().to_string(), expr.clone());
                 }
                 let replaced_push_predicates = push_predicates
-                    .iter()
-                    .map(|expr| replace_cols_by_name(expr.clone(), &replace_map))
+                    .into_iter()
+                    .map(|expr| replace_cols_by_name(expr, &replace_map))
                     .collect::<Result<Vec<_>>>()?;
 
-                let child = match conjunction(replaced_push_predicates) {
-                    Some(predicate) => LogicalPlan::Filter(Filter::try_new(
-                        predicate,
-                        agg.input.clone(),
-                    )?),
-                    None => (*agg.input).clone(),
+                let agg_input = Arc::clone(&agg.input);
+                Transformed::yes(LogicalPlan::Aggregate(agg))
+                    .transform_data(|new_plan| {
+                        // If we have a filter to push, we push it down to the input of the aggregate
+                        if let Some(predicate) = conjunction(replaced_push_predicates) {
+                            let new_filter = make_filter(predicate, agg_input)?;
+                            insert_below(new_plan, new_filter)
+                        } else {
+                            Ok(Transformed::no(new_plan))
+                        }
+                    })?
+                    .map_data(|child_plan| {
+                        // if there are any remaining predicates we can't push, add them
+                        // back as a filter
+                        if let Some(predicate) = conjunction(keep_predicates) {
+                            make_filter(predicate, Arc::new(child_plan))
+                        } else {
+                            Ok(child_plan)
+                        }
+                    })
+            }
+            // Tries to push filters based on the partition key(s) of the window function(s) used.
+            // Example:
+            //   Before:
+            //     Filter: (a > 1) and (b > 1) and (c > 1)
+            //      Window: func() PARTITION BY [a] ...
+            //   ---
+            //   After:
+            //     Filter: (b > 1) and (c > 1)
+            //      Window: func() PARTITION BY [a] ...
+            //        Filter: (a > 1)
+            LogicalPlan::Window(window) => {
+                // Retrieve the set of potential partition keys where we can push filters by.
+                // Unlike aggregations, where there is only one statement per SELECT, there can be
+                // multiple window functions, each with potentially different partition keys.
+                // Therefore, we need to ensure that any potential partition key returned is used in
+                // ALL window functions. Otherwise, filters cannot be pushed by through that column.
+                let extract_partition_keys = |func: &WindowFunction| {
+                    func.params
+                        .partition_by
+                        .iter()
+                        .map(|c| {
+                            let (relation, name) = c.qualified_name();
+                            Column::new(relation, name)
+                        })
+                        .collect::<HashSet<_>>()
                 };
-                let new_agg = filter
-                    .input
-                    .with_new_exprs(filter.input.expressions(), vec![child])?;
-                match conjunction(keep_predicates) {
-                    Some(predicate) => LogicalPlan::Filter(Filter::try_new(
-                        predicate,
-                        Arc::new(new_agg),
-                    )?),
-                    None => new_agg,
-                }
-            }
-            LogicalPlan::Join(join) => {
-                match push_down_join(&filter.input, join, Some(&filter.predicate))? {
-                    Some(optimized_plan) => optimized_plan,
-                    None => return Ok(None),
-                }
-            }
-            LogicalPlan::CrossJoin(cross_join) => {
-                let predicates = split_conjunction_owned(filter.predicate.clone());
-                let join = convert_cross_join_to_inner_join(cross_join.clone())?;
-                let join_plan = LogicalPlan::Join(join);
-                let inputs = join_plan.inputs();
-                let left = inputs[0];
-                let right = inputs[1];
-                let plan = push_down_all_join(
-                    predicates,
-                    vec![],
-                    &join_plan,
-                    left,
-                    right,
-                    vec![],
-                    true,
-                )?;
-                convert_to_cross_join_if_beneficial(plan)?
-            }
-            LogicalPlan::TableScan(scan) => {
-                let filter_predicates = split_conjunction(&filter.predicate);
-                let results = scan
-                    .source
-                    .supports_filters_pushdown(filter_predicates.as_slice())?;
-                if filter_predicates.len() != results.len() {
-                    return internal_err!(
-                        "Vec returned length: {} from supports_filters_pushdown is not the same size as the filters passed, which length is: {}",
-                        results.len(),
-                        filter_predicates.len());
+                let potential_partition_keys = window
+                    .window_expr
+                    .iter()
+                    .map(|e| {
+                        match e {
+                            Expr::WindowFunction(window_func) => {
+                                extract_partition_keys(window_func)
+                            }
+                            Expr::Alias(alias) => {
+                                if let Expr::WindowFunction(window_func) =
+                                    alias.expr.as_ref()
+                                {
+                                    extract_partition_keys(window_func)
+                                } else {
+                                    // window functions expressions are only Expr::WindowFunction
+                                    unreachable!()
+                                }
+                            }
+                            _ => {
+                                // window functions expressions are only Expr::WindowFunction
+                                unreachable!()
+                            }
+                        }
+                    })
+                    // performs the set intersection of the partition keys of all window functions,
+                    // returning only the common ones
+                    .reduce(|a, b| &a & &b)
+                    .unwrap_or_default();
+
+                let predicates = split_conjunction_owned(filter.predicate);
+                let mut keep_predicates = vec![];
+                let mut push_predicates = vec![];
+                for expr in predicates {
+                    let cols = expr.column_refs();
+                    if cols.iter().all(|c| potential_partition_keys.contains(c)) {
+                        push_predicates.push(expr);
+                    } else {
+                        keep_predicates.push(expr);
+                    }
                 }
 
-                let zip = filter_predicates.iter().zip(results);
+                // Unlike with aggregations, there are no cases where we have to replace, e.g.,
+                // `a+b` with Column(a)+Column(b). This is because partition expressions are not
+                // available as standalone columns to the user. For example, while an aggregation on
+                // `a+b` becomes Column(a + b), in a window partition it becomes
+                // `func() PARTITION BY [a + b] ...`. Thus, filters on expressions always remain in
+                // place, so we can use `push_predicates` directly. This is consistent with other
+                // optimizers, such as the one used by Postgres.
+
+                let window_input = Arc::clone(&window.input);
+                Transformed::yes(LogicalPlan::Window(window))
+                    .transform_data(|new_plan| {
+                        // If we have a filter to push, we push it down to the input of the window
+                        if let Some(predicate) = conjunction(push_predicates) {
+                            let new_filter = make_filter(predicate, window_input)?;
+                            insert_below(new_plan, new_filter)
+                        } else {
+                            Ok(Transformed::no(new_plan))
+                        }
+                    })?
+                    .map_data(|child_plan| {
+                        // if there are any remaining predicates we can't push, add them
+                        // back as a filter
+                        if let Some(predicate) = conjunction(keep_predicates) {
+                            make_filter(predicate, Arc::new(child_plan))
+                        } else {
+                            Ok(child_plan)
+                        }
+                    })
+            }
+            LogicalPlan::Join(join) => push_down_join(join, Some(&filter.predicate)),
+            LogicalPlan::TableScan(scan) => {
+                let filter_predicates = split_conjunction(&filter.predicate);
+
+                let (volatile_filters, non_volatile_filters): (Vec<&Expr>, Vec<&Expr>) =
+                    filter_predicates
+                        .into_iter()
+                        .partition(|pred| pred.is_volatile());
+
+                // Check which non-volatile filters are supported by source
+                let supported_filters = scan
+                    .source
+                    .supports_filters_pushdown(non_volatile_filters.as_slice())?;
+                assert_eq_or_internal_err!(
+                    non_volatile_filters.len(),
+                    supported_filters.len(),
+                    "Vec returned length: {} from supports_filters_pushdown is not the same size as the filters passed, which length is: {}",
+                    supported_filters.len(),
+                    non_volatile_filters.len()
+                );
+
+                // Compose scan filters from non-volatile filters of `Exact` or `Inexact` pushdown type
+                let zip = non_volatile_filters.into_iter().zip(supported_filters);
 
                 let new_scan_filters = zip
                     .clone()
                     .filter(|(_, res)| res != &TableProviderFilterPushDown::Unsupported)
-                    .map(|(pred, _)| *pred);
+                    .map(|(pred, _)| pred);
+
+                // Add new scan filters
                 let new_scan_filters: Vec<Expr> = scan
                     .filters
                     .iter()
@@ -874,39 +1160,67 @@ impl OptimizerRule for PushDownFilter {
                     .unique()
                     .cloned()
                     .collect();
+
+                // Compose predicates to be of `Unsupported` or `Inexact` pushdown type, and also include volatile filters
                 let new_predicate: Vec<Expr> = zip
                     .filter(|(_, res)| res != &TableProviderFilterPushDown::Exact)
-                    .map(|(pred, _)| (*pred).clone())
+                    .map(|(pred, _)| pred)
+                    .chain(volatile_filters)
+                    .cloned()
                     .collect();
 
                 let new_scan = LogicalPlan::TableScan(TableScan {
-                    source: scan.source.clone(),
-                    projection: scan.projection.clone(),
-                    projected_schema: scan.projected_schema.clone(),
-                    table_name: scan.table_name.clone(),
                     filters: new_scan_filters,
-                    fetch: scan.fetch,
+                    ..scan
                 });
 
-                match conjunction(new_predicate) {
-                    Some(predicate) => LogicalPlan::Filter(Filter::try_new(
-                        predicate,
-                        Arc::new(new_scan),
-                    )?),
-                    None => new_scan,
-                }
+                Transformed::yes(new_scan).transform_data(|new_scan| {
+                    if let Some(predicate) = conjunction(new_predicate) {
+                        make_filter(predicate, Arc::new(new_scan)).map(Transformed::yes)
+                    } else {
+                        Ok(Transformed::no(new_scan))
+                    }
+                })
             }
             LogicalPlan::Extension(extension_plan) => {
+                // This check prevents the Filter from being removed when the extension node has no children,
+                // so we return the original Filter unchanged.
+                if extension_plan.node.inputs().is_empty() {
+                    filter.input = Arc::new(LogicalPlan::Extension(extension_plan));
+                    return Ok(Transformed::no(LogicalPlan::Filter(filter)));
+                }
                 let prevent_cols =
                     extension_plan.node.prevent_predicate_push_down_columns();
 
-                let predicates = split_conjunction_owned(filter.predicate.clone());
+                // determine if we can push any predicates down past the extension node
 
+                // each element is true for push, false to keep
+                let predicate_push_or_keep = split_conjunction(&filter.predicate)
+                    .iter()
+                    .map(|expr| {
+                        let cols = expr.column_refs();
+                        if cols.iter().any(|c| prevent_cols.contains(&c.name)) {
+                            Ok(false) // No push (keep)
+                        } else {
+                            Ok(true) // push
+                        }
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                // all predicates are kept, no changes needed
+                if predicate_push_or_keep.iter().all(|&x| !x) {
+                    filter.input = Arc::new(LogicalPlan::Extension(extension_plan));
+                    return Ok(Transformed::no(LogicalPlan::Filter(filter)));
+                }
+
+                // going to push some predicates down, so split the predicates
                 let mut keep_predicates = vec![];
                 let mut push_predicates = vec![];
-                for expr in predicates {
-                    let cols = expr.to_columns()?;
-                    if cols.iter().any(|c| prevent_cols.contains(&c.name)) {
+                for (push, expr) in predicate_push_or_keep
+                    .into_iter()
+                    .zip(split_conjunction_owned(filter.predicate).into_iter())
+                {
+                    if !push {
                         keep_predicates.push(expr);
                     } else {
                         push_predicates.push(expr);
@@ -928,64 +1242,146 @@ impl OptimizerRule for PushDownFilter {
                     None => extension_plan.node.inputs().into_iter().cloned().collect(),
                 };
                 // extension with new inputs.
+                let child_plan = LogicalPlan::Extension(extension_plan);
                 let new_extension =
                     child_plan.with_new_exprs(child_plan.expressions(), new_children)?;
 
-                match conjunction(keep_predicates) {
+                let new_plan = match conjunction(keep_predicates) {
                     Some(predicate) => LogicalPlan::Filter(Filter::try_new(
                         predicate,
                         Arc::new(new_extension),
                     )?),
                     None => new_extension,
-                }
+                };
+                Ok(Transformed::yes(new_plan))
             }
-            _ => return Ok(None),
-        };
-        Ok(Some(new_plan))
+            child => {
+                filter.input = Arc::new(child);
+                Ok(Transformed::no(LogicalPlan::Filter(filter)))
+            }
+        }
     }
+}
+
+/// Attempts to push `predicate` into a `FilterExec` below `projection
+///
+/// # Returns
+/// (plan, remaining_predicate)
+///
+/// `plan` is a LogicalPlan for `projection` with possibly a new FilterExec below it.
+/// `remaining_predicate` is any part of the predicate that could not be pushed down
+///
+/// # Args
+/// - predicates: Split predicates like `[foo=5, bar=6]`
+/// - projection: The target projection plan to push down the predicates
+///
+/// # Example
+///
+/// Pushing a predicate like `foo=5 AND bar=6` with an input plan like this:
+///
+/// ```text
+/// Projection(foo, c+d as bar)
+/// ```
+///
+/// Might result in returning `remaining_predicate` of `bar=6` and a plan like
+///
+/// ```text
+/// Projection(foo, c+d as bar)
+///  Filter(foo=5)
+///   ...
+/// ```
+fn rewrite_projection(
+    predicates: Vec<Expr>,
+    mut projection: Projection,
+) -> Result<(Transformed<LogicalPlan>, Option<Expr>)> {
+    // A projection is filter-commutable if it do not contain volatile predicates or contain volatile
+    // predicates that are not used in the filter. However, we should re-writes all predicate expressions.
+    // collect projection.
+    let (volatile_map, non_volatile_map): (HashMap<_, _>, HashMap<_, _>) = projection
+        .schema
+        .iter()
+        .zip(projection.expr.iter())
+        .map(|((qualifier, field), expr)| {
+            // strip alias, as they should not be part of filters
+            let expr = expr.clone().unalias();
+
+            (qualified_name(qualifier, field.name()), expr)
+        })
+        .partition(|(_, value)| value.is_volatile());
+
+    let mut push_predicates = vec![];
+    let mut keep_predicates = vec![];
+    for expr in predicates {
+        if contain(&expr, &volatile_map) {
+            keep_predicates.push(expr);
+        } else {
+            push_predicates.push(expr);
+        }
+    }
+
+    match conjunction(push_predicates) {
+        Some(expr) => {
+            // re-write all filters based on this projection
+            // E.g. in `Filter: b\n  Projection: a > 1 as b`, we can swap them, but the filter must be "a > 1"
+            let new_filter = LogicalPlan::Filter(Filter::try_new(
+                replace_cols_by_name(expr, &non_volatile_map)?,
+                std::mem::take(&mut projection.input),
+            )?);
+
+            projection.input = Arc::new(new_filter);
+
+            Ok((
+                Transformed::yes(LogicalPlan::Projection(projection)),
+                conjunction(keep_predicates),
+            ))
+        }
+        None => Ok((Transformed::no(LogicalPlan::Projection(projection)), None)),
+    }
+}
+
+/// Creates a new LogicalPlan::Filter node.
+pub fn make_filter(predicate: Expr, input: Arc<LogicalPlan>) -> Result<LogicalPlan> {
+    Filter::try_new(predicate, input).map(LogicalPlan::Filter)
+}
+
+/// Replace the existing child of the single input node with `new_child`.
+///
+/// Starting:
+/// ```text
+/// plan
+///   child
+/// ```
+///
+/// Ending:
+/// ```text
+/// plan
+///   new_child
+/// ```
+fn insert_below(
+    plan: LogicalPlan,
+    new_child: LogicalPlan,
+) -> Result<Transformed<LogicalPlan>> {
+    let mut new_child = Some(new_child);
+    let transformed_plan = plan.map_children(|_child| {
+        if let Some(new_child) = new_child.take() {
+            Ok(Transformed::yes(new_child))
+        } else {
+            // already took the new child
+            internal_err!("node had more than one input")
+        }
+    })?;
+
+    // make sure we did the actual replacement
+    assert_or_internal_err!(new_child.is_none(), "node had no inputs");
+
+    Ok(transformed_plan)
 }
 
 impl PushDownFilter {
-    #[allow(missing_docs)]
+    #[expect(missing_docs)]
     pub fn new() -> Self {
         Self {}
     }
-}
-
-/// Converts the given cross join to an inner join with an empty equality
-/// predicate and an empty filter condition.
-fn convert_cross_join_to_inner_join(cross_join: CrossJoin) -> Result<Join> {
-    let CrossJoin { left, right, .. } = cross_join;
-    let join_schema = build_join_schema(left.schema(), right.schema(), &JoinType::Inner)?;
-    Ok(Join {
-        left,
-        right,
-        join_type: JoinType::Inner,
-        join_constraint: JoinConstraint::On,
-        on: vec![],
-        filter: None,
-        schema: DFSchemaRef::new(join_schema),
-        null_equals_null: true,
-    })
-}
-
-/// Converts the given inner join with an empty equality predicate and an
-/// empty filter condition to a cross join.
-fn convert_to_cross_join_if_beneficial(plan: LogicalPlan) -> Result<LogicalPlan> {
-    if let LogicalPlan::Join(join) = &plan {
-        // Can be converted back to cross join
-        if join.on.is_empty() && join.filter.is_none() {
-            return LogicalPlanBuilder::from(join.left.as_ref().clone())
-                .cross_join(join.right.as_ref().clone())?
-                .build();
-        }
-    } else if let LogicalPlan::Filter(filter) = &plan {
-        let new_input =
-            convert_to_cross_join_if_beneficial(filter.input.as_ref().clone())?;
-        return Filter::try_new(filter.predicate.clone(), Arc::new(new_input))
-            .map(LogicalPlan::Filter);
-    }
-    Ok(plan)
 }
 
 /// replaces columns by its name on the projection.
@@ -993,7 +1389,7 @@ pub fn replace_cols_by_name(
     e: Expr,
     replace_map: &HashMap<String, Expr>,
 ) -> Result<Expr> {
-    e.transform_up(&|expr| {
+    e.transform_up(|expr| {
         Ok(if let Expr::Column(c) = &expr {
             match replace_map.get(&c.flat_name()) {
                 Some(new_c) => Transformed::yes(new_c.clone()),
@@ -1009,7 +1405,7 @@ pub fn replace_cols_by_name(
 /// check whether the expression uses the columns in `check_map`.
 fn contain(e: &Expr, check_map: &HashMap<String, Expr>) -> bool {
     let mut is_contain = false;
-    e.apply(&mut |expr| {
+    e.apply(|expr| {
         Ok(if let Expr::Column(c) = &expr {
             match check_map.get(&c.flat_name()) {
                 Some(_) => {
@@ -1028,52 +1424,64 @@ fn contain(e: &Expr, check_map: &HashMap<String, Expr>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::any::Any;
+    use std::cmp::Ordering;
     use std::fmt::{Debug, Formatter};
-    use std::sync::Arc;
-
-    use crate::optimizer::Optimizer;
-    use crate::rewrite_disjunctive_predicate::RewriteDisjunctivePredicate;
-    use crate::test::*;
-    use crate::OptimizerContext;
 
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use datafusion_common::{DFSchema, DFSchemaRef, ScalarValue};
-    use datafusion_expr::expr::ScalarFunction;
+    use async_trait::async_trait;
+
+    use datafusion_common::{DFSchemaRef, DataFusionError, ScalarValue};
+    use datafusion_expr::expr::{ScalarFunction, WindowFunction};
     use datafusion_expr::logical_plan::table_scan;
     use datafusion_expr::{
-        and, col, in_list, in_subquery, lit, logical_plan::JoinType, or, sum, BinaryExpr,
-        ColumnarValue, Expr, Extension, LogicalPlanBuilder, Operator, ScalarUDF,
-        ScalarUDFImpl, Signature, TableSource, TableType, UserDefinedLogicalNodeCore,
-        Volatility,
+        ColumnarValue, ExprFunctionExt, Extension, LogicalPlanBuilder,
+        ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, TableSource, TableType,
+        UserDefinedLogicalNodeCore, Volatility, WindowFunctionDefinition, col, in_list,
+        in_subquery, lit,
     };
 
-    use async_trait::async_trait;
+    use crate::OptimizerContext;
+    use crate::assert_optimized_plan_eq_snapshot;
+    use crate::optimizer::Optimizer;
+    use crate::simplify_expressions::SimplifyExpressions;
+    use crate::test::*;
+    use datafusion_expr::test::function_stub::sum;
+    use insta::assert_snapshot;
+
+    use super::*;
+
     fn observe(_plan: &LogicalPlan, _rule: &dyn OptimizerRule) {}
 
-    fn assert_optimized_plan_eq(plan: LogicalPlan, expected: &str) -> Result<()> {
-        crate::test::assert_optimized_plan_eq(
-            Arc::new(PushDownFilter::new()),
-            plan,
-            expected,
-        )
+    macro_rules! assert_optimized_plan_equal {
+        (
+            $plan:expr,
+            @ $expected:literal $(,)?
+        ) => {{
+            let optimizer_ctx = OptimizerContext::new().with_max_passes(1);
+            let rules: Vec<Arc<dyn crate::OptimizerRule + Send + Sync>> = vec![Arc::new(PushDownFilter::new())];
+            assert_optimized_plan_eq_snapshot!(
+                optimizer_ctx,
+                rules,
+                $plan,
+                @ $expected,
+            )
+        }};
     }
 
-    fn assert_optimized_plan_eq_with_rewrite_predicate(
-        plan: LogicalPlan,
-        expected: &str,
-    ) -> Result<()> {
-        let optimizer = Optimizer::with_rules(vec![
-            Arc::new(RewriteDisjunctivePredicate::new()),
-            Arc::new(PushDownFilter::new()),
-        ]);
-        let optimized_plan =
-            optimizer.optimize(plan, &OptimizerContext::new(), observe)?;
-
-        let formatted_plan = format!("{optimized_plan:?}");
-        assert_eq!(expected, formatted_plan);
-        Ok(())
+    macro_rules! assert_optimized_plan_eq_with_rewrite_predicate {
+        (
+            $plan:expr,
+            @ $expected:literal $(,)?
+        ) => {{
+            let optimizer = Optimizer::with_rules(vec![
+                Arc::new(SimplifyExpressions::new()),
+                Arc::new(PushDownFilter::new()),
+            ]);
+            let optimized_plan = optimizer.optimize($plan, &OptimizerContext::new(), observe)?;
+            assert_snapshot!(optimized_plan, @ $expected);
+            Ok::<(), DataFusionError>(())
+        }};
     }
 
     #[test]
@@ -1084,10 +1492,13 @@ mod tests {
             .filter(col("a").eq(lit(1i64)))?
             .build()?;
         // filter is before projection
-        let expected = "\
-            Projection: test.a, test.b\
-            \n  TableScan: test, full_filters=[test.a = Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a, test.b
+          TableScan: test, full_filters=[test.a = Int64(1)]
+        "
+        )
     }
 
     #[test]
@@ -1099,12 +1510,15 @@ mod tests {
             .filter(col("a").eq(lit(1i64)))?
             .build()?;
         // filter is before single projection
-        let expected = "\
-            Filter: test.a = Int64(1)\
-            \n  Limit: skip=0, fetch=10\
-            \n    Projection: test.a, test.b\
-            \n      TableScan: test";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test.a = Int64(1)
+          Limit: skip=0, fetch=10
+            Projection: test.a, test.b
+              TableScan: test
+        "
+        )
     }
 
     #[test]
@@ -1113,8 +1527,10 @@ mod tests {
         let plan = LogicalPlanBuilder::from(table_scan)
             .filter(lit(0i64).eq(lit(1i64)))?
             .build()?;
-        let expected = "TableScan: test, full_filters=[Int64(0) = Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @"TableScan: test, full_filters=[Int64(0) = Int64(1)]"
+        )
     }
 
     #[test]
@@ -1126,11 +1542,14 @@ mod tests {
             .filter(col("a").eq(lit(1i64)))?
             .build()?;
         // filter is before double projection
-        let expected = "\
-            Projection: test.c, test.b\
-            \n  Projection: test.a, test.b, test.c\
-            \n    TableScan: test, full_filters=[test.a = Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.c, test.b
+          Projection: test.a, test.b, test.c
+            TableScan: test, full_filters=[test.a = Int64(1)]
+        "
+        )
     }
 
     #[test]
@@ -1141,10 +1560,37 @@ mod tests {
             .filter(col("a").gt(lit(10i64)))?
             .build()?;
         // filter of key aggregation is commutative
-        let expected = "\
-            Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b) AS total_salary]]\
-            \n  TableScan: test, full_filters=[test.a > Int64(10)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b) AS total_salary]]
+          TableScan: test, full_filters=[test.a > Int64(10)]
+        "
+        )
+    }
+
+    /// verifies that filters with unusual column names are pushed down through aggregate operators
+    #[test]
+    fn filter_move_agg_special() -> Result<()> {
+        let schema = Schema::new(vec![
+            Field::new("$a", DataType::UInt32, false),
+            Field::new("$b", DataType::UInt32, false),
+            Field::new("$c", DataType::UInt32, false),
+        ]);
+        let table_scan = table_scan(Some("test"), &schema, None)?.build()?;
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .aggregate(vec![col("$a")], vec![sum(col("$b")).alias("total_salary")])?
+            .filter(col("$a").gt(lit(10i64)))?
+            .build()?;
+        // filter of key aggregation is commutative
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Aggregate: groupBy=[[test.$a]], aggr=[[sum(test.$b) AS total_salary]]
+          TableScan: test, full_filters=[test.$a > Int64(10)]
+        "
+        )
     }
 
     #[test]
@@ -1154,10 +1600,14 @@ mod tests {
             .aggregate(vec![add(col("b"), col("a"))], vec![sum(col("a")), col("b")])?
             .filter(col("b").gt(lit(10i64)))?
             .build()?;
-        let expected = "Filter: test.b > Int64(10)\
-        \n  Aggregate: groupBy=[[test.b + test.a]], aggr=[[SUM(test.a), test.b]]\
-        \n    TableScan: test";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test.b > Int64(10)
+          Aggregate: groupBy=[[test.b + test.a]], aggr=[[sum(test.a), test.b]]
+            TableScan: test
+        "
+        )
     }
 
     #[test]
@@ -1166,10 +1616,13 @@ mod tests {
             .aggregate(vec![add(col("b"), col("a"))], vec![sum(col("a")), col("b")])?
             .filter(col("test.b + test.a").gt(lit(10i64)))?
             .build()?;
-        let expected =
-            "Aggregate: groupBy=[[test.b + test.a]], aggr=[[SUM(test.a), test.b]]\
-        \n  TableScan: test, full_filters=[test.b + test.a > Int64(10)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Aggregate: groupBy=[[test.b + test.a]], aggr=[[sum(test.a), test.b]]
+          TableScan: test, full_filters=[test.b + test.a > Int64(10)]
+        "
+        )
     }
 
     #[test]
@@ -1180,11 +1633,291 @@ mod tests {
             .filter(col("b").gt(lit(10i64)))?
             .build()?;
         // filter of aggregate is after aggregation since they are non-commutative
-        let expected = "\
-            Filter: b > Int64(10)\
-            \n  Aggregate: groupBy=[[test.a]], aggr=[[SUM(test.b) AS b]]\
-            \n    TableScan: test";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: b > Int64(10)
+          Aggregate: groupBy=[[test.a]], aggr=[[sum(test.b) AS b]]
+            TableScan: test
+        "
+        )
+    }
+
+    /// verifies that when partitioning by 'a' and 'b', and filtering by 'b', 'b' is pushed
+    #[test]
+    fn filter_move_window() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let window = Expr::from(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(
+                datafusion_functions_window::rank::rank_udwf(),
+            ),
+            vec![],
+        ))
+        .partition_by(vec![col("a"), col("b")])
+        .order_by(vec![col("c").sort(true, true)])
+        .build()
+        .unwrap();
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .window(vec![window])?
+            .filter(col("b").gt(lit(10i64)))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        WindowAggr: windowExpr=[[rank() PARTITION BY [test.a, test.b] ORDER BY [test.c ASC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+          TableScan: test, full_filters=[test.b > Int64(10)]
+        "
+        )
+    }
+
+    /// verifies that filters with unusual identifier names are pushed down through window functions
+    #[test]
+    fn filter_window_special_identifier() -> Result<()> {
+        let schema = Schema::new(vec![
+            Field::new("$a", DataType::UInt32, false),
+            Field::new("$b", DataType::UInt32, false),
+            Field::new("$c", DataType::UInt32, false),
+        ]);
+        let table_scan = table_scan(Some("test"), &schema, None)?.build()?;
+
+        let window = Expr::from(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(
+                datafusion_functions_window::rank::rank_udwf(),
+            ),
+            vec![],
+        ))
+        .partition_by(vec![col("$a"), col("$b")])
+        .order_by(vec![col("$c").sort(true, true)])
+        .build()
+        .unwrap();
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .window(vec![window])?
+            .filter(col("$b").gt(lit(10i64)))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        WindowAggr: windowExpr=[[rank() PARTITION BY [test.$a, test.$b] ORDER BY [test.$c ASC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+          TableScan: test, full_filters=[test.$b > Int64(10)]
+        "
+        )
+    }
+
+    /// verifies that when partitioning by 'a' and 'b', and filtering by 'a' and 'b', both 'a' and
+    /// 'b' are pushed
+    #[test]
+    fn filter_move_complex_window() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let window = Expr::from(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(
+                datafusion_functions_window::rank::rank_udwf(),
+            ),
+            vec![],
+        ))
+        .partition_by(vec![col("a"), col("b")])
+        .order_by(vec![col("c").sort(true, true)])
+        .build()
+        .unwrap();
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .window(vec![window])?
+            .filter(and(col("a").gt(lit(10i64)), col("b").eq(lit(1i64))))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        WindowAggr: windowExpr=[[rank() PARTITION BY [test.a, test.b] ORDER BY [test.c ASC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+          TableScan: test, full_filters=[test.a > Int64(10), test.b = Int64(1)]
+        "
+        )
+    }
+
+    /// verifies that when partitioning by 'a' and filtering by 'a' and 'b', only 'a' is pushed
+    #[test]
+    fn filter_move_partial_window() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let window = Expr::from(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(
+                datafusion_functions_window::rank::rank_udwf(),
+            ),
+            vec![],
+        ))
+        .partition_by(vec![col("a")])
+        .order_by(vec![col("c").sort(true, true)])
+        .build()
+        .unwrap();
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .window(vec![window])?
+            .filter(and(col("a").gt(lit(10i64)), col("b").eq(lit(1i64))))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test.b = Int64(1)
+          WindowAggr: windowExpr=[[rank() PARTITION BY [test.a] ORDER BY [test.c ASC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+            TableScan: test, full_filters=[test.a > Int64(10)]
+        "
+        )
+    }
+
+    /// verifies that filters on partition expressions are not pushed, as the single expression
+    /// column is not available to the user, unlike with aggregations
+    #[test]
+    fn filter_expression_keep_window() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let window = Expr::from(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(
+                datafusion_functions_window::rank::rank_udwf(),
+            ),
+            vec![],
+        ))
+        .partition_by(vec![add(col("a"), col("b"))]) // PARTITION BY a + b
+        .order_by(vec![col("c").sort(true, true)])
+        .build()
+        .unwrap();
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .window(vec![window])?
+            // unlike with aggregations, single partition column "test.a + test.b" is not available
+            // to the plan, so we use multiple columns when filtering
+            .filter(add(col("a"), col("b")).gt(lit(10i64)))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test.a + test.b > Int64(10)
+          WindowAggr: windowExpr=[[rank() PARTITION BY [test.a + test.b] ORDER BY [test.c ASC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+            TableScan: test
+        "
+        )
+    }
+
+    /// verifies that filters are not pushed on order by columns (that are not used in partitioning)
+    #[test]
+    fn filter_order_keep_window() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let window = Expr::from(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(
+                datafusion_functions_window::rank::rank_udwf(),
+            ),
+            vec![],
+        ))
+        .partition_by(vec![col("a")])
+        .order_by(vec![col("c").sort(true, true)])
+        .build()
+        .unwrap();
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .window(vec![window])?
+            .filter(col("c").gt(lit(10i64)))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test.c > Int64(10)
+          WindowAggr: windowExpr=[[rank() PARTITION BY [test.a] ORDER BY [test.c ASC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+            TableScan: test
+        "
+        )
+    }
+
+    /// verifies that when we use multiple window functions with a common partition key, the filter
+    /// on that key is pushed
+    #[test]
+    fn filter_multiple_windows_common_partitions() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let window1 = Expr::from(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(
+                datafusion_functions_window::rank::rank_udwf(),
+            ),
+            vec![],
+        ))
+        .partition_by(vec![col("a")])
+        .order_by(vec![col("c").sort(true, true)])
+        .build()
+        .unwrap();
+
+        let window2 = Expr::from(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(
+                datafusion_functions_window::rank::rank_udwf(),
+            ),
+            vec![],
+        ))
+        .partition_by(vec![col("b"), col("a")])
+        .order_by(vec![col("c").sort(true, true)])
+        .build()
+        .unwrap();
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .window(vec![window1, window2])?
+            .filter(col("a").gt(lit(10i64)))? // a appears in both window functions
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        WindowAggr: windowExpr=[[rank() PARTITION BY [test.a] ORDER BY [test.c ASC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, rank() PARTITION BY [test.b, test.a] ORDER BY [test.c ASC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+          TableScan: test, full_filters=[test.a > Int64(10)]
+        "
+        )
+    }
+
+    /// verifies that when we use multiple window functions with different partitions keys, the
+    /// filter cannot be pushed
+    #[test]
+    fn filter_multiple_windows_disjoint_partitions() -> Result<()> {
+        let table_scan = test_table_scan()?;
+
+        let window1 = Expr::from(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(
+                datafusion_functions_window::rank::rank_udwf(),
+            ),
+            vec![],
+        ))
+        .partition_by(vec![col("a")])
+        .order_by(vec![col("c").sort(true, true)])
+        .build()
+        .unwrap();
+
+        let window2 = Expr::from(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(
+                datafusion_functions_window::rank::rank_udwf(),
+            ),
+            vec![],
+        ))
+        .partition_by(vec![col("b"), col("a")])
+        .order_by(vec![col("c").sort(true, true)])
+        .build()
+        .unwrap();
+
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .window(vec![window1, window2])?
+            .filter(col("b").gt(lit(10i64)))? // b only appears in one window function
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test.b > Int64(10)
+          WindowAggr: windowExpr=[[rank() PARTITION BY [test.a] ORDER BY [test.c ASC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, rank() PARTITION BY [test.b, test.a] ORDER BY [test.c ASC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+            TableScan: test
+        "
+        )
     }
 
     /// verifies that a filter is pushed to before a projection, the filter expression is correctly re-written
@@ -1196,10 +1929,13 @@ mod tests {
             .filter(col("b").eq(lit(1i64)))?
             .build()?;
         // filter is before projection
-        let expected = "\
-            Projection: test.a AS b, test.c\
-            \n  TableScan: test, full_filters=[test.a = Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a AS b, test.c
+          TableScan: test, full_filters=[test.a = Int64(1)]
+        "
+        )
     }
 
     fn add(left: Expr, right: Expr) -> Expr {
@@ -1231,19 +1967,21 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "\
-            Filter: b = Int64(1)\
-            \n  Projection: test.a * Int32(2) + test.c AS b, test.c\
-            \n    TableScan: test"
+        assert_snapshot!(plan,
+        @r"
+        Filter: b = Int64(1)
+          Projection: test.a * Int32(2) + test.c AS b, test.c
+            TableScan: test
+        ",
         );
-
         // filter is before projection
-        let expected = "\
-            Projection: test.a * Int32(2) + test.c AS b, test.c\
-            \n  TableScan: test, full_filters=[test.a * Int32(2) + test.c = Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a * Int32(2) + test.c AS b, test.c
+          TableScan: test, full_filters=[test.a * Int32(2) + test.c = Int64(1)]
+        "
+        )
     }
 
     /// verifies that when a filter is pushed to after 2 projections, the filter expression is correctly re-written
@@ -1261,27 +1999,39 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "\
-            Filter: a = Int64(1)\
-            \n  Projection: b * Int32(3) AS a, test.c\
-            \n    Projection: test.a * Int32(2) + test.c AS b, test.c\
-            \n      TableScan: test"
+        assert_snapshot!(plan,
+        @r"
+        Filter: a = Int64(1)
+          Projection: b * Int32(3) AS a, test.c
+            Projection: test.a * Int32(2) + test.c AS b, test.c
+              TableScan: test
+        ",
         );
-
         // filter is before the projections
-        let expected = "\
-        Projection: b * Int32(3) AS a, test.c\
-        \n  Projection: test.a * Int32(2) + test.c AS b, test.c\
-        \n    TableScan: test, full_filters=[(test.a * Int32(2) + test.c) * Int32(3) = Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: b * Int32(3) AS a, test.c
+          Projection: test.a * Int32(2) + test.c AS b, test.c
+            TableScan: test, full_filters=[(test.a * Int32(2) + test.c) * Int32(3) = Int64(1)]
+        "
+        )
     }
 
     #[derive(Debug, PartialEq, Eq, Hash)]
     struct NoopPlan {
         input: Vec<LogicalPlan>,
         schema: DFSchemaRef,
+    }
+
+    // Manual implementation needed because of `schema` field. Comparison excludes this field.
+    impl PartialOrd for NoopPlan {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            self.input
+                .partial_cmp(&other.input)
+                // TODO (https://github.com/apache/datafusion/issues/17477) avoid recomparing all fields
+                .filter(|cmp| *cmp != Ordering::Equal || self == other)
+        }
     }
 
     impl UserDefinedLogicalNodeCore for NoopPlan {
@@ -1312,11 +2062,19 @@ mod tests {
             write!(f, "NoopPlan")
         }
 
-        fn from_template(&self, _exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
-            Self {
-                input: inputs.to_vec(),
-                schema: self.schema.clone(),
-            }
+        fn with_exprs_and_inputs(
+            &self,
+            _exprs: Vec<Expr>,
+            inputs: Vec<LogicalPlan>,
+        ) -> Result<Self> {
+            Ok(Self {
+                input: inputs,
+                schema: Arc::clone(&self.schema),
+            })
+        }
+
+        fn supports_limit_pushdown(&self) -> bool {
+            false // Disallow limit push-down by default
         }
     }
 
@@ -1327,7 +2085,7 @@ mod tests {
         let custom_plan = LogicalPlan::Extension(Extension {
             node: Arc::new(NoopPlan {
                 input: vec![table_scan.clone()],
-                schema: table_scan.schema().clone(),
+                schema: Arc::clone(table_scan.schema()),
             }),
         });
         let plan = LogicalPlanBuilder::from(custom_plan)
@@ -1335,15 +2093,18 @@ mod tests {
             .build()?;
 
         // Push filter below NoopPlan
-        let expected = "\
-            NoopPlan\
-            \n  TableScan: test, full_filters=[test.a = Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)?;
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        NoopPlan
+          TableScan: test, full_filters=[test.a = Int64(1)]
+        "
+        )?;
 
         let custom_plan = LogicalPlan::Extension(Extension {
             node: Arc::new(NoopPlan {
                 input: vec![table_scan.clone()],
-                schema: table_scan.schema().clone(),
+                schema: Arc::clone(table_scan.schema()),
             }),
         });
         let plan = LogicalPlanBuilder::from(custom_plan)
@@ -1351,16 +2112,19 @@ mod tests {
             .build()?;
 
         // Push only predicate on `a` below NoopPlan
-        let expected = "\
-            Filter: test.c = Int64(2)\
-            \n  NoopPlan\
-            \n    TableScan: test, full_filters=[test.a = Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)?;
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test.c = Int64(2)
+          NoopPlan
+            TableScan: test, full_filters=[test.a = Int64(1)]
+        "
+        )?;
 
         let custom_plan = LogicalPlan::Extension(Extension {
             node: Arc::new(NoopPlan {
                 input: vec![table_scan.clone(), table_scan.clone()],
-                schema: table_scan.schema().clone(),
+                schema: Arc::clone(table_scan.schema()),
             }),
         });
         let plan = LogicalPlanBuilder::from(custom_plan)
@@ -1368,16 +2132,19 @@ mod tests {
             .build()?;
 
         // Push filter below NoopPlan for each child branch
-        let expected = "\
-            NoopPlan\
-            \n  TableScan: test, full_filters=[test.a = Int64(1)]\
-            \n  TableScan: test, full_filters=[test.a = Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)?;
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        NoopPlan
+          TableScan: test, full_filters=[test.a = Int64(1)]
+          TableScan: test, full_filters=[test.a = Int64(1)]
+        "
+        )?;
 
         let custom_plan = LogicalPlan::Extension(Extension {
             node: Arc::new(NoopPlan {
                 input: vec![table_scan.clone(), table_scan.clone()],
-                schema: table_scan.schema().clone(),
+                schema: Arc::clone(table_scan.schema()),
             }),
         });
         let plan = LogicalPlanBuilder::from(custom_plan)
@@ -1385,79 +2152,86 @@ mod tests {
             .build()?;
 
         // Push only predicate on `a` below NoopPlan
-        let expected = "\
-            Filter: test.c = Int64(2)\
-            \n  NoopPlan\
-            \n    TableScan: test, full_filters=[test.a = Int64(1)]\
-            \n    TableScan: test, full_filters=[test.a = Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test.c = Int64(2)
+          NoopPlan
+            TableScan: test, full_filters=[test.a = Int64(1)]
+            TableScan: test, full_filters=[test.a = Int64(1)]
+        "
+        )
     }
 
     /// verifies that when two filters apply after an aggregation that only allows one to be pushed, one is pushed
     /// and the other not.
     #[test]
     fn multi_filter() -> Result<()> {
-        // the aggregation allows one filter to pass (b), and the other one to not pass (SUM(c))
+        // the aggregation allows one filter to pass (b), and the other one to not pass (sum(c))
         let table_scan = test_table_scan()?;
         let plan = LogicalPlanBuilder::from(table_scan)
             .project(vec![col("a").alias("b"), col("c")])?
             .aggregate(vec![col("b")], vec![sum(col("c"))])?
             .filter(col("b").gt(lit(10i64)))?
-            .filter(col("SUM(test.c)").gt(lit(10i64)))?
+            .filter(col("sum(test.c)").gt(lit(10i64)))?
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "\
-            Filter: SUM(test.c) > Int64(10)\
-            \n  Filter: b > Int64(10)\
-            \n    Aggregate: groupBy=[[b]], aggr=[[SUM(test.c)]]\
-            \n      Projection: test.a AS b, test.c\
-            \n        TableScan: test"
+        assert_snapshot!(plan,
+        @r"
+        Filter: sum(test.c) > Int64(10)
+          Filter: b > Int64(10)
+            Aggregate: groupBy=[[b]], aggr=[[sum(test.c)]]
+              Projection: test.a AS b, test.c
+                TableScan: test
+        ",
         );
-
         // filter is before the projections
-        let expected = "\
-        Filter: SUM(test.c) > Int64(10)\
-        \n  Aggregate: groupBy=[[b]], aggr=[[SUM(test.c)]]\
-        \n    Projection: test.a AS b, test.c\
-        \n      TableScan: test, full_filters=[test.a > Int64(10)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: sum(test.c) > Int64(10)
+          Aggregate: groupBy=[[b]], aggr=[[sum(test.c)]]
+            Projection: test.a AS b, test.c
+              TableScan: test, full_filters=[test.a > Int64(10)]
+        "
+        )
     }
 
     /// verifies that when a filter with two predicates is applied after an aggregation that only allows one to be pushed, one is pushed
     /// and the other not.
     #[test]
     fn split_filter() -> Result<()> {
-        // the aggregation allows one filter to pass (b), and the other one to not pass (SUM(c))
+        // the aggregation allows one filter to pass (b), and the other one to not pass (sum(c))
         let table_scan = test_table_scan()?;
         let plan = LogicalPlanBuilder::from(table_scan)
             .project(vec![col("a").alias("b"), col("c")])?
             .aggregate(vec![col("b")], vec![sum(col("c"))])?
             .filter(and(
-                col("SUM(test.c)").gt(lit(10i64)),
-                and(col("b").gt(lit(10i64)), col("SUM(test.c)").lt(lit(20i64))),
+                col("sum(test.c)").gt(lit(10i64)),
+                and(col("b").gt(lit(10i64)), col("sum(test.c)").lt(lit(20i64))),
             ))?
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "\
-            Filter: SUM(test.c) > Int64(10) AND b > Int64(10) AND SUM(test.c) < Int64(20)\
-            \n  Aggregate: groupBy=[[b]], aggr=[[SUM(test.c)]]\
-            \n    Projection: test.a AS b, test.c\
-            \n      TableScan: test"
+        assert_snapshot!(plan,
+        @r"
+        Filter: sum(test.c) > Int64(10) AND b > Int64(10) AND sum(test.c) < Int64(20)
+          Aggregate: groupBy=[[b]], aggr=[[sum(test.c)]]
+            Projection: test.a AS b, test.c
+              TableScan: test
+        ",
         );
-
         // filter is before the projections
-        let expected = "\
-        Filter: SUM(test.c) > Int64(10) AND SUM(test.c) < Int64(20)\
-        \n  Aggregate: groupBy=[[b]], aggr=[[SUM(test.c)]]\
-        \n    Projection: test.a AS b, test.c\
-        \n      TableScan: test, full_filters=[test.a > Int64(10)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: sum(test.c) > Int64(10) AND sum(test.c) < Int64(20)
+          Aggregate: groupBy=[[b]], aggr=[[sum(test.c)]]
+            Projection: test.a AS b, test.c
+              TableScan: test, full_filters=[test.a > Int64(10)]
+        "
+        )
     }
 
     /// verifies that when two limits are in place, we jump neither
@@ -1472,14 +2246,17 @@ mod tests {
             .filter(col("a").eq(lit(1i64)))?
             .build()?;
         // filter does not just any of the limits
-        let expected = "\
-            Projection: test.a, test.b\
-            \n  Filter: test.a = Int64(1)\
-            \n    Limit: skip=0, fetch=10\
-            \n      Limit: skip=0, fetch=20\
-            \n        Projection: test.a, test.b\
-            \n          TableScan: test";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a, test.b
+          Filter: test.a = Int64(1)
+            Limit: skip=0, fetch=10
+              Limit: skip=0, fetch=20
+                Projection: test.a, test.b
+                  TableScan: test
+        "
+        )
     }
 
     #[test]
@@ -1491,10 +2268,14 @@ mod tests {
             .filter(col("a").eq(lit(1i64)))?
             .build()?;
         // filter appears below Union
-        let expected = "Union\
-        \n  TableScan: test, full_filters=[test.a = Int64(1)]\
-        \n  TableScan: test2, full_filters=[test2.a = Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Union
+          TableScan: test, full_filters=[test.a = Int64(1)]
+          TableScan: test2, full_filters=[test2.a = Int64(1)]
+        "
+        )
     }
 
     #[test]
@@ -1511,13 +2292,18 @@ mod tests {
             .build()?;
 
         // filter appears below Union
-        let expected = "Union\n  SubqueryAlias: test2\
-        \n    Projection: test.a AS b\
-        \n      TableScan: test, full_filters=[test.a = Int64(1)]\
-        \n  SubqueryAlias: test2\
-        \n    Projection: test.a AS b\
-        \n      TableScan: test, full_filters=[test.a = Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Union
+          SubqueryAlias: test2
+            Projection: test.a AS b
+              TableScan: test, full_filters=[test.a = Int64(1)]
+          SubqueryAlias: test2
+            Projection: test.a AS b
+              TableScan: test, full_filters=[test.a = Int64(1)]
+        "
+        )
     }
 
     #[test]
@@ -1541,14 +2327,17 @@ mod tests {
             .filter(filter)?
             .build()?;
 
-        let expected = "Projection: test.a, test1.d\
-        \n  CrossJoin:\
-        \n    Projection: test.a, test.b, test.c\
-        \n      TableScan: test, full_filters=[test.a = Int32(1)]\
-        \n    Projection: test1.d, test1.e, test1.f\
-        \n      TableScan: test1, full_filters=[test1.d > Int32(2)]";
-
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a, test1.d
+          Cross Join: 
+            Projection: test.a, test.b, test.c
+              TableScan: test, full_filters=[test.a = Int32(1)]
+            Projection: test1.d, test1.e, test1.f
+              TableScan: test1, full_filters=[test1.d > Int32(2)]
+        "
+        )
     }
 
     #[test]
@@ -1568,13 +2357,17 @@ mod tests {
             .filter(filter)?
             .build()?;
 
-        let expected = "Projection: test.a, test1.a\
-        \n  CrossJoin:\
-        \n    Projection: test.a, test.b, test.c\
-        \n      TableScan: test, full_filters=[test.a = Int32(1)]\
-        \n    Projection: test1.a, test1.b, test1.c\
-        \n      TableScan: test1, full_filters=[test1.a > Int32(2)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a, test1.a
+          Cross Join: 
+            Projection: test.a, test.b, test.c
+              TableScan: test, full_filters=[test.a = Int32(1)]
+            Projection: test1.a, test1.b, test1.c
+              TableScan: test1, full_filters=[test1.a > Int32(2)]
+        "
+        )
     }
 
     /// verifies that filters with the same columns are correctly placed
@@ -1591,24 +2384,26 @@ mod tests {
         // Should be able to move both filters below the projections
 
         // not part of the test
-        assert_eq!(
-            format!("{plan:?}"),
-            "Filter: test.a >= Int64(1)\
-             \n  Projection: test.a\
-             \n    Limit: skip=0, fetch=1\
-             \n      Filter: test.a <= Int64(1)\
-             \n        Projection: test.a\
-             \n          TableScan: test"
+        assert_snapshot!(plan,
+        @r"
+        Filter: test.a >= Int64(1)
+          Projection: test.a
+            Limit: skip=0, fetch=1
+              Filter: test.a <= Int64(1)
+                Projection: test.a
+                  TableScan: test
+        ",
         );
-
-        let expected = "\
-        Projection: test.a\
-        \n  Filter: test.a >= Int64(1)\
-        \n    Limit: skip=0, fetch=1\
-        \n      Projection: test.a\
-        \n        TableScan: test, full_filters=[test.a <= Int64(1)]";
-
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a
+          Filter: test.a >= Int64(1)
+            Limit: skip=0, fetch=1
+              Projection: test.a
+                TableScan: test, full_filters=[test.a <= Int64(1)]
+        "
+        )
     }
 
     /// verifies that filters to be placed on the same depth are ANDed
@@ -1623,22 +2418,24 @@ mod tests {
             .build()?;
 
         // not part of the test
-        assert_eq!(
-            format!("{plan:?}"),
-            "Projection: test.a\
-            \n  Filter: test.a >= Int64(1)\
-            \n    Filter: test.a <= Int64(1)\
-            \n      Limit: skip=0, fetch=1\
-            \n        TableScan: test"
+        assert_snapshot!(plan,
+        @r"
+        Projection: test.a
+          Filter: test.a >= Int64(1)
+            Filter: test.a <= Int64(1)
+              Limit: skip=0, fetch=1
+                TableScan: test
+        ",
         );
-
-        let expected = "\
-        Projection: test.a\
-        \n  Filter: test.a >= Int64(1) AND test.a <= Int64(1)\
-        \n    Limit: skip=0, fetch=1\
-        \n      TableScan: test";
-
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a
+          Filter: test.a >= Int64(1) AND test.a <= Int64(1)
+            Limit: skip=0, fetch=1
+              TableScan: test
+        "
+        )
     }
 
     /// verifies that filters on a plan with user nodes are not lost
@@ -1652,19 +2449,21 @@ mod tests {
 
         let plan = user_defined::new(plan);
 
-        let expected = "\
-            TestUserDefined\
-             \n  Filter: test.a <= Int64(1)\
-             \n    TableScan: test";
-
         // not part of the test
-        assert_eq!(format!("{plan:?}"), expected);
-
-        let expected = "\
-        TestUserDefined\
-         \n  TableScan: test, full_filters=[test.a <= Int64(1)]";
-
-        assert_optimized_plan_eq(plan, expected)
+        assert_snapshot!(plan,
+        @r"
+        TestUserDefined
+          Filter: test.a <= Int64(1)
+            TableScan: test
+        ",
+        );
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        TestUserDefined
+          TableScan: test, full_filters=[test.a <= Int64(1)]
+        "
+        )
     }
 
     /// post-on-join predicates on a column common to both sides is pushed to both sides
@@ -1687,22 +2486,25 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "Filter: test.a <= Int64(1)\
-            \n  Inner Join: test.a = test2.a\
-            \n    TableScan: test\
-            \n    Projection: test2.a\
-            \n      TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Filter: test.a <= Int64(1)
+          Inner Join: test.a = test2.a
+            TableScan: test
+            Projection: test2.a
+              TableScan: test2
+        ",
         );
-
         // filter sent to side before the join
-        let expected = "\
-        Inner Join: test.a = test2.a\
-        \n  TableScan: test, full_filters=[test.a <= Int64(1)]\
-        \n  Projection: test2.a\
-        \n    TableScan: test2, full_filters=[test2.a <= Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Inner Join: test.a = test2.a
+          TableScan: test, full_filters=[test.a <= Int64(1)]
+          Projection: test2.a
+            TableScan: test2, full_filters=[test2.a <= Int64(1)]
+        "
+        )
     }
 
     /// post-using-join predicates on a column common to both sides is pushed to both sides
@@ -1724,25 +2526,28 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "Filter: test.a <= Int64(1)\
-            \n  Inner Join: Using test.a = test2.a\
-            \n    TableScan: test\
-            \n    Projection: test2.a\
-            \n      TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Filter: test.a <= Int64(1)
+          Inner Join: Using test.a = test2.a
+            TableScan: test
+            Projection: test2.a
+              TableScan: test2
+        ",
         );
-
         // filter sent to side before the join
-        let expected = "\
-        Inner Join: Using test.a = test2.a\
-        \n  TableScan: test, full_filters=[test.a <= Int64(1)]\
-        \n  Projection: test2.a\
-        \n    TableScan: test2, full_filters=[test2.a <= Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Inner Join: Using test.a = test2.a
+          TableScan: test, full_filters=[test.a <= Int64(1)]
+          Projection: test2.a
+            TableScan: test2, full_filters=[test2.a <= Int64(1)]
+        "
+        )
     }
 
-    /// post-join predicates with columns from both sides are converted to join filterss
+    /// post-join predicates with columns from both sides are converted to join filters
     #[test]
     fn filter_join_on_common_dependent() -> Result<()> {
         let table_scan = test_table_scan()?;
@@ -1764,24 +2569,27 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "Filter: test.c <= test2.b\
-            \n  Inner Join: test.a = test2.a\
-            \n    Projection: test.a, test.c\
-            \n      TableScan: test\
-            \n    Projection: test2.a, test2.b\
-            \n      TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Filter: test.c <= test2.b
+          Inner Join: test.a = test2.a
+            Projection: test.a, test.c
+              TableScan: test
+            Projection: test2.a, test2.b
+              TableScan: test2
+        ",
         );
-
         // Filter is converted to Join Filter
-        let expected = "\
-        Inner Join: test.a = test2.a Filter: test.c <= test2.b\
-        \n  Projection: test.a, test.c\
-        \n    TableScan: test\
-        \n  Projection: test2.a, test2.b\
-        \n    TableScan: test2";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Inner Join: test.a = test2.a Filter: test.c <= test2.b
+          Projection: test.a, test.c
+            TableScan: test
+          Projection: test2.a, test2.b
+            TableScan: test2
+        "
+        )
     }
 
     /// post-join predicates with columns from one side of a join are pushed only to that side
@@ -1807,23 +2615,26 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "Filter: test.b <= Int64(1)\
-            \n  Inner Join: test.a = test2.a\
-            \n    Projection: test.a, test.b\
-            \n      TableScan: test\
-            \n    Projection: test2.a, test2.c\
-            \n      TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Filter: test.b <= Int64(1)
+          Inner Join: test.a = test2.a
+            Projection: test.a, test.b
+              TableScan: test
+            Projection: test2.a, test2.c
+              TableScan: test2
+        ",
         );
-
-        let expected = "\
-        Inner Join: test.a = test2.a\
-        \n  Projection: test.a, test.b\
-        \n    TableScan: test, full_filters=[test.b <= Int64(1)]\
-        \n  Projection: test2.a, test2.c\
-        \n    TableScan: test2";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Inner Join: test.a = test2.a
+          Projection: test.a, test.b
+            TableScan: test, full_filters=[test.b <= Int64(1)]
+          Projection: test2.a, test2.c
+            TableScan: test2
+        "
+        )
     }
 
     /// post-join predicates on the right side of a left join are not duplicated
@@ -1846,23 +2657,26 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "Filter: test2.a <= Int64(1)\
-            \n  Left Join: Using test.a = test2.a\
-            \n    TableScan: test\
-            \n    Projection: test2.a\
-            \n      TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Filter: test2.a <= Int64(1)
+          Left Join: Using test.a = test2.a
+            TableScan: test
+            Projection: test2.a
+              TableScan: test2
+        ",
         );
-
         // filter not duplicated nor pushed down - i.e. noop
-        let expected = "\
-        Filter: test2.a <= Int64(1)\
-        \n  Left Join: Using test.a = test2.a\
-        \n    TableScan: test\
-        \n    Projection: test2.a\
-        \n      TableScan: test2";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test2.a <= Int64(1)
+          Left Join: Using test.a = test2.a
+            TableScan: test, full_filters=[test.a <= Int64(1)]
+            Projection: test2.a
+              TableScan: test2
+        "
+        )
     }
 
     /// post-join predicates on the left side of a right join are not duplicated
@@ -1884,23 +2698,26 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "Filter: test.a <= Int64(1)\
-            \n  Right Join: Using test.a = test2.a\
-            \n    TableScan: test\
-            \n    Projection: test2.a\
-            \n      TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Filter: test.a <= Int64(1)
+          Right Join: Using test.a = test2.a
+            TableScan: test
+            Projection: test2.a
+              TableScan: test2
+        ",
         );
-
         // filter not duplicated nor pushed down - i.e. noop
-        let expected = "\
-        Filter: test.a <= Int64(1)\
-        \n  Right Join: Using test.a = test2.a\
-        \n    TableScan: test\
-        \n    Projection: test2.a\
-        \n      TableScan: test2";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test.a <= Int64(1)
+          Right Join: Using test.a = test2.a
+            TableScan: test
+            Projection: test2.a
+              TableScan: test2, full_filters=[test2.a <= Int64(1)]
+        "
+        )
     }
 
     /// post-left-join predicate on a column common to both sides is only pushed to the left side
@@ -1923,22 +2740,25 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "Filter: test.a <= Int64(1)\
-            \n  Left Join: Using test.a = test2.a\
-            \n    TableScan: test\
-            \n    Projection: test2.a\
-            \n      TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Filter: test.a <= Int64(1)
+          Left Join: Using test.a = test2.a
+            TableScan: test
+            Projection: test2.a
+              TableScan: test2
+        ",
         );
-
         // filter sent to left side of the join, not the right
-        let expected = "\
-        Left Join: Using test.a = test2.a\
-        \n  TableScan: test, full_filters=[test.a <= Int64(1)]\
-        \n  Projection: test2.a\
-        \n    TableScan: test2";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Left Join: Using test.a = test2.a
+          TableScan: test, full_filters=[test.a <= Int64(1)]
+          Projection: test2.a
+            TableScan: test2
+        "
+        )
     }
 
     /// post-right-join predicate on a column common to both sides is only pushed to the right side
@@ -1961,22 +2781,25 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "Filter: test2.a <= Int64(1)\
-            \n  Right Join: Using test.a = test2.a\
-            \n    TableScan: test\
-            \n    Projection: test2.a\
-            \n      TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Filter: test2.a <= Int64(1)
+          Right Join: Using test.a = test2.a
+            TableScan: test
+            Projection: test2.a
+              TableScan: test2
+        ",
         );
-
         // filter sent to right side of join, not duplicated to the left
-        let expected = "\
-        Right Join: Using test.a = test2.a\
-        \n  TableScan: test\
-        \n  Projection: test2.a\
-        \n    TableScan: test2, full_filters=[test2.a <= Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Right Join: Using test.a = test2.a
+          TableScan: test
+          Projection: test2.a
+            TableScan: test2, full_filters=[test2.a <= Int64(1)]
+        "
+        )
     }
 
     /// single table predicate parts of ON condition should be pushed to both inputs
@@ -2004,22 +2827,25 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "Inner Join: test.a = test2.a Filter: test.c > UInt32(1) AND test.b < test2.b AND test2.c > UInt32(4)\
-            \n  Projection: test.a, test.b, test.c\
-            \n    TableScan: test\
-            \n  Projection: test2.a, test2.b, test2.c\
-            \n    TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Inner Join: test.a = test2.a Filter: test.c > UInt32(1) AND test.b < test2.b AND test2.c > UInt32(4)
+          Projection: test.a, test.b, test.c
+            TableScan: test
+          Projection: test2.a, test2.b, test2.c
+            TableScan: test2
+        ",
         );
-
-        let expected = "\
-        Inner Join: test.a = test2.a Filter: test.b < test2.b\
-        \n  Projection: test.a, test.b, test.c\
-        \n    TableScan: test, full_filters=[test.c > UInt32(1)]\
-        \n  Projection: test2.a, test2.b, test2.c\
-        \n    TableScan: test2, full_filters=[test2.c > UInt32(4)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Inner Join: test.a = test2.a Filter: test.b < test2.b
+          Projection: test.a, test.b, test.c
+            TableScan: test, full_filters=[test.c > UInt32(1)]
+          Projection: test2.a, test2.b, test2.c
+            TableScan: test2, full_filters=[test2.c > UInt32(4)]
+        "
+        )
     }
 
     /// join filter should be completely removed after pushdown
@@ -2046,22 +2872,25 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "Inner Join: test.a = test2.a Filter: test.b > UInt32(1) AND test2.c > UInt32(4)\
-            \n  Projection: test.a, test.b, test.c\
-            \n    TableScan: test\
-            \n  Projection: test2.a, test2.b, test2.c\
-            \n    TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Inner Join: test.a = test2.a Filter: test.b > UInt32(1) AND test2.c > UInt32(4)
+          Projection: test.a, test.b, test.c
+            TableScan: test
+          Projection: test2.a, test2.b, test2.c
+            TableScan: test2
+        ",
         );
-
-        let expected = "\
-        Inner Join: test.a = test2.a\
-        \n  Projection: test.a, test.b, test.c\
-        \n    TableScan: test, full_filters=[test.b > UInt32(1)]\
-        \n  Projection: test2.a, test2.b, test2.c\
-        \n    TableScan: test2, full_filters=[test2.c > UInt32(4)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Inner Join: test.a = test2.a
+          Projection: test.a, test.b, test.c
+            TableScan: test, full_filters=[test.b > UInt32(1)]
+          Projection: test2.a, test2.b, test2.c
+            TableScan: test2, full_filters=[test2.c > UInt32(4)]
+        "
+        )
     }
 
     /// predicate on join key in filter expression should be pushed down to both inputs
@@ -2086,22 +2915,25 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "Inner Join: test.a = test2.b Filter: test.a > UInt32(1)\
-            \n  Projection: test.a\
-            \n    TableScan: test\
-            \n  Projection: test2.b\
-            \n    TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Inner Join: test.a = test2.b Filter: test.a > UInt32(1)
+          Projection: test.a
+            TableScan: test
+          Projection: test2.b
+            TableScan: test2
+        ",
         );
-
-        let expected = "\
-        Inner Join: test.a = test2.b\
-        \n  Projection: test.a\
-        \n    TableScan: test, full_filters=[test.a > UInt32(1)]\
-        \n  Projection: test2.b\
-        \n    TableScan: test2, full_filters=[test2.b > UInt32(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Inner Join: test.a = test2.b
+          Projection: test.a
+            TableScan: test, full_filters=[test.a > UInt32(1)]
+          Projection: test2.b
+            TableScan: test2, full_filters=[test2.b > UInt32(1)]
+        "
+        )
     }
 
     /// single table predicate parts of ON condition should be pushed to right input
@@ -2129,22 +2961,25 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "Left Join: test.a = test2.a Filter: test.a > UInt32(1) AND test.b < test2.b AND test2.c > UInt32(4)\
-            \n  Projection: test.a, test.b, test.c\
-            \n    TableScan: test\
-            \n  Projection: test2.a, test2.b, test2.c\
-            \n    TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Left Join: test.a = test2.a Filter: test.a > UInt32(1) AND test.b < test2.b AND test2.c > UInt32(4)
+          Projection: test.a, test.b, test.c
+            TableScan: test
+          Projection: test2.a, test2.b, test2.c
+            TableScan: test2
+        ",
         );
-
-        let expected = "\
-        Left Join: test.a = test2.a Filter: test.a > UInt32(1) AND test.b < test2.b\
-        \n  Projection: test.a, test.b, test.c\
-        \n    TableScan: test\
-        \n  Projection: test2.a, test2.b, test2.c\
-        \n    TableScan: test2, full_filters=[test2.c > UInt32(4)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Left Join: test.a = test2.a Filter: test.a > UInt32(1) AND test.b < test2.b
+          Projection: test.a, test.b, test.c
+            TableScan: test
+          Projection: test2.a, test2.b, test2.c
+            TableScan: test2, full_filters=[test2.c > UInt32(4)]
+        "
+        )
     }
 
     /// single table predicate parts of ON condition should be pushed to left input
@@ -2172,22 +3007,25 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "Right Join: test.a = test2.a Filter: test.a > UInt32(1) AND test.b < test2.b AND test2.c > UInt32(4)\
-            \n  Projection: test.a, test.b, test.c\
-            \n    TableScan: test\
-            \n  Projection: test2.a, test2.b, test2.c\
-            \n    TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Right Join: test.a = test2.a Filter: test.a > UInt32(1) AND test.b < test2.b AND test2.c > UInt32(4)
+          Projection: test.a, test.b, test.c
+            TableScan: test
+          Projection: test2.a, test2.b, test2.c
+            TableScan: test2
+        ",
         );
-
-        let expected = "\
-        Right Join: test.a = test2.a Filter: test.b < test2.b AND test2.c > UInt32(4)\
-        \n  Projection: test.a, test.b, test.c\
-        \n    TableScan: test, full_filters=[test.a > UInt32(1)]\
-        \n  Projection: test2.a, test2.b, test2.c\
-        \n    TableScan: test2";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Right Join: test.a = test2.a Filter: test.b < test2.b AND test2.c > UInt32(4)
+          Projection: test.a, test.b, test.c
+            TableScan: test, full_filters=[test.a > UInt32(1)]
+          Projection: test2.a, test2.b, test2.c
+            TableScan: test2
+        "
+        )
     }
 
     /// single table predicate parts of ON condition should not be pushed
@@ -2215,17 +3053,25 @@ mod tests {
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "Full Join: test.a = test2.a Filter: test.a > UInt32(1) AND test.b < test2.b AND test2.c > UInt32(4)\
-            \n  Projection: test.a, test.b, test.c\
-            \n    TableScan: test\
-            \n  Projection: test2.a, test2.b, test2.c\
-            \n    TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Full Join: test.a = test2.a Filter: test.a > UInt32(1) AND test.b < test2.b AND test2.c > UInt32(4)
+          Projection: test.a, test.b, test.c
+            TableScan: test
+          Projection: test2.a, test2.b, test2.c
+            TableScan: test2
+        ",
         );
-
-        let expected = &format!("{plan:?}");
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Full Join: test.a = test2.a Filter: test.a > UInt32(1) AND test.b < test2.b AND test2.c > UInt32(4)
+          Projection: test.a, test.b, test.c
+            TableScan: test
+          Projection: test2.a, test2.b, test2.c
+            TableScan: test2
+        "
+        )
     }
 
     struct PushDownProvider {
@@ -2245,35 +3091,43 @@ mod tests {
             TableType::Base
         }
 
-        fn supports_filter_pushdown(
+        fn supports_filters_pushdown(
             &self,
-            _e: &Expr,
-        ) -> Result<TableProviderFilterPushDown> {
-            Ok(self.filter_support.clone())
+            filters: &[&Expr],
+        ) -> Result<Vec<TableProviderFilterPushDown>> {
+            Ok((0..filters.len())
+                .map(|_| self.filter_support.clone())
+                .collect())
         }
 
-        fn as_any(&self) -> &dyn std::any::Any {
+        fn as_any(&self) -> &dyn Any {
             self
         }
+    }
+
+    fn table_scan_with_pushdown_provider_builder(
+        filter_support: TableProviderFilterPushDown,
+        filters: Vec<Expr>,
+        projection: Option<Vec<usize>>,
+    ) -> Result<LogicalPlanBuilder> {
+        let test_provider = PushDownProvider { filter_support };
+
+        let table_scan = LogicalPlan::TableScan(TableScan {
+            table_name: "test".into(),
+            filters,
+            projected_schema: Arc::new(DFSchema::try_from(test_provider.schema())?),
+            projection,
+            source: Arc::new(test_provider),
+            fetch: None,
+        });
+
+        Ok(LogicalPlanBuilder::from(table_scan))
     }
 
     fn table_scan_with_pushdown_provider(
         filter_support: TableProviderFilterPushDown,
     ) -> Result<LogicalPlan> {
-        let test_provider = PushDownProvider { filter_support };
-
-        let table_scan = LogicalPlan::TableScan(TableScan {
-            table_name: "test".into(),
-            filters: vec![],
-            projected_schema: Arc::new(DFSchema::try_from(
-                (*test_provider.schema()).clone(),
-            )?),
-            projection: None,
-            source: Arc::new(test_provider),
-            fetch: None,
-        });
-
-        LogicalPlanBuilder::from(table_scan)
+        table_scan_with_pushdown_provider_builder(filter_support, vec![], None)?
             .filter(col("a").eq(lit(1i64)))?
             .build()
     }
@@ -2282,9 +3136,10 @@ mod tests {
     fn filter_with_table_provider_exact() -> Result<()> {
         let plan = table_scan_with_pushdown_provider(TableProviderFilterPushDown::Exact)?;
 
-        let expected = "\
-        TableScan: test, full_filters=[a = Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @"TableScan: test, full_filters=[a = Int64(1)]"
+        )
     }
 
     #[test]
@@ -2292,10 +3147,13 @@ mod tests {
         let plan =
             table_scan_with_pushdown_provider(TableProviderFilterPushDown::Inexact)?;
 
-        let expected = "\
-        Filter: a = Int64(1)\
-        \n  TableScan: test, partial_filters=[a = Int64(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: a = Int64(1)
+          TableScan: test, partial_filters=[a = Int64(1)]
+        "
+        )
     }
 
     #[test]
@@ -2304,17 +3162,19 @@ mod tests {
             table_scan_with_pushdown_provider(TableProviderFilterPushDown::Inexact)?;
 
         let optimized_plan = PushDownFilter::new()
-            .try_optimize(&plan, &OptimizerContext::new())
+            .rewrite(plan, &OptimizerContext::new())
             .expect("failed to optimize plan")
-            .unwrap();
-
-        let expected = "\
-        Filter: a = Int64(1)\
-        \n  TableScan: test, partial_filters=[a = Int64(1)]";
+            .data;
 
         // Optimizing the same plan multiple times should produce the same plan
         // each time.
-        assert_optimized_plan_eq(optimized_plan, expected)
+        assert_optimized_plan_equal!(
+            optimized_plan,
+            @r"
+        Filter: a = Int64(1)
+          TableScan: test, partial_filters=[a = Int64(1)]
+        "
+        )
     }
 
     #[test]
@@ -2322,70 +3182,54 @@ mod tests {
         let plan =
             table_scan_with_pushdown_provider(TableProviderFilterPushDown::Unsupported)?;
 
-        let expected = "\
-        Filter: a = Int64(1)\
-        \n  TableScan: test";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: a = Int64(1)
+          TableScan: test
+        "
+        )
     }
 
     #[test]
     fn multi_combined_filter() -> Result<()> {
-        let test_provider = PushDownProvider {
-            filter_support: TableProviderFilterPushDown::Inexact,
-        };
+        let plan = table_scan_with_pushdown_provider_builder(
+            TableProviderFilterPushDown::Inexact,
+            vec![col("a").eq(lit(10i64)), col("b").gt(lit(11i64))],
+            Some(vec![0]),
+        )?
+        .filter(and(col("a").eq(lit(10i64)), col("b").gt(lit(11i64))))?
+        .project(vec![col("a"), col("b")])?
+        .build()?;
 
-        let table_scan = LogicalPlan::TableScan(TableScan {
-            table_name: "test".into(),
-            filters: vec![col("a").eq(lit(10i64)), col("b").gt(lit(11i64))],
-            projected_schema: Arc::new(DFSchema::try_from(
-                (*test_provider.schema()).clone(),
-            )?),
-            projection: Some(vec![0]),
-            source: Arc::new(test_provider),
-            fetch: None,
-        });
-
-        let plan = LogicalPlanBuilder::from(table_scan)
-            .filter(and(col("a").eq(lit(10i64)), col("b").gt(lit(11i64))))?
-            .project(vec![col("a"), col("b")])?
-            .build()?;
-
-        let expected = "Projection: a, b\
-            \n  Filter: a = Int64(10) AND b > Int64(11)\
-            \n    TableScan: test projection=[a], partial_filters=[a = Int64(10), b > Int64(11)]";
-
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: a, b
+          Filter: a = Int64(10) AND b > Int64(11)
+            TableScan: test projection=[a], partial_filters=[a = Int64(10), b > Int64(11)]
+        "
+        )
     }
 
     #[test]
     fn multi_combined_filter_exact() -> Result<()> {
-        let test_provider = PushDownProvider {
-            filter_support: TableProviderFilterPushDown::Exact,
-        };
+        let plan = table_scan_with_pushdown_provider_builder(
+            TableProviderFilterPushDown::Exact,
+            vec![],
+            Some(vec![0]),
+        )?
+        .filter(and(col("a").eq(lit(10i64)), col("b").gt(lit(11i64))))?
+        .project(vec![col("a"), col("b")])?
+        .build()?;
 
-        let table_scan = LogicalPlan::TableScan(TableScan {
-            table_name: "test".into(),
-            filters: vec![],
-            projected_schema: Arc::new(DFSchema::try_from(
-                (*test_provider.schema()).clone(),
-            )?),
-            projection: Some(vec![0]),
-            source: Arc::new(test_provider),
-            fetch: None,
-        });
-
-        let plan = LogicalPlanBuilder::from(table_scan)
-            .filter(and(col("a").eq(lit(10i64)), col("b").gt(lit(11i64))))?
-            .project(vec![col("a"), col("b")])?
-            .build()?;
-
-        let expected = r#"
-Projection: a, b
-  TableScan: test projection=[a], full_filters=[a = Int64(10), b > Int64(11)]
-        "#
-        .trim();
-
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: a, b
+          TableScan: test projection=[a], full_filters=[a = Int64(10), b > Int64(11)]
+        "
+        )
     }
 
     #[test]
@@ -2400,20 +3244,21 @@ Projection: a, b
             .build()?;
 
         // filter on col b
-        assert_eq!(
-            format!("{plan:?}"),
-            "Filter: b > Int64(10) AND test.c > Int64(10)\
-            \n  Projection: test.a AS b, test.c\
-            \n    TableScan: test"
+        assert_snapshot!(plan,
+        @r"
+        Filter: b > Int64(10) AND test.c > Int64(10)
+          Projection: test.a AS b, test.c
+            TableScan: test
+        ",
         );
-
         // rewrite filter col b to test.a
-        let expected = "\
-            Projection: test.a AS b, test.c\
-            \n  TableScan: test, full_filters=[test.a > Int64(10), test.c > Int64(10)]\
-            ";
-
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a AS b, test.c
+          TableScan: test, full_filters=[test.a > Int64(10), test.c > Int64(10)]
+        "
+        )
     }
 
     #[test]
@@ -2429,23 +3274,23 @@ Projection: a, b
             .build()?;
 
         // filter on col b
-        assert_eq!(
-            format!("{plan:?}"),
-            "Filter: b > Int64(10) AND test.c > Int64(10)\
-            \n  Projection: b, test.c\
-            \n    Projection: test.a AS b, test.c\
-            \n      TableScan: test\
-            "
+        assert_snapshot!(plan,
+        @r"
+        Filter: b > Int64(10) AND test.c > Int64(10)
+          Projection: b, test.c
+            Projection: test.a AS b, test.c
+              TableScan: test
+        ",
         );
-
         // rewrite filter col b to test.a
-        let expected = "\
-            Projection: b, test.c\
-            \n  Projection: test.a AS b, test.c\
-            \n    TableScan: test, full_filters=[test.a > Int64(10), test.c > Int64(10)]\
-            ";
-
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: b, test.c
+          Projection: test.a AS b, test.c
+            TableScan: test, full_filters=[test.a > Int64(10), test.c > Int64(10)]
+        "
+        )
     }
 
     #[test]
@@ -2457,20 +3302,21 @@ Projection: a, b
             .build()?;
 
         // filter on col b and d
-        assert_eq!(
-            format!("{plan:?}"),
-            "Filter: b > Int64(10) AND d > Int64(10)\
-            \n  Projection: test.a AS b, test.c AS d\
-            \n    TableScan: test\
-            "
+        assert_snapshot!(plan,
+        @r"
+        Filter: b > Int64(10) AND d > Int64(10)
+          Projection: test.a AS b, test.c AS d
+            TableScan: test
+        ",
         );
-
         // rewrite filter col b to test.a, col d to test.c
-        let expected = "\
-            Projection: test.a AS b, test.c AS d\
-            \n  TableScan: test, full_filters=[test.a > Int64(10), test.c > Int64(10)]";
-
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a AS b, test.c AS d
+          TableScan: test, full_filters=[test.a > Int64(10), test.c > Int64(10)]
+        "
+        )
     }
 
     /// predicate on join key in filter expression should be pushed down to both inputs
@@ -2494,23 +3340,26 @@ Projection: a, b
             )?
             .build()?;
 
-        assert_eq!(
-            format!("{plan:?}"),
-            "Inner Join: c = d Filter: c > UInt32(1)\
-            \n  Projection: test.a AS c\
-            \n    TableScan: test\
-            \n  Projection: test2.b AS d\
-            \n    TableScan: test2"
+        assert_snapshot!(plan,
+        @r"
+        Inner Join: c = d Filter: c > UInt32(1)
+          Projection: test.a AS c
+            TableScan: test
+          Projection: test2.b AS d
+            TableScan: test2
+        ",
         );
-
         // Change filter on col `c`, 'd' to `test.a`, 'test.b'
-        let expected = "\
-        Inner Join: c = d\
-        \n  Projection: test.a AS c\
-        \n    TableScan: test, full_filters=[test.a > UInt32(1)]\
-        \n  Projection: test2.b AS d\
-        \n    TableScan: test2, full_filters=[test2.b > UInt32(1)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Inner Join: c = d
+          Projection: test.a AS c
+            TableScan: test, full_filters=[test.a > UInt32(1)]
+          Projection: test2.b AS d
+            TableScan: test2, full_filters=[test2.b > UInt32(1)]
+        "
+        )
     }
 
     #[test]
@@ -2526,20 +3375,21 @@ Projection: a, b
             .build()?;
 
         // filter on col b
-        assert_eq!(
-            format!("{plan:?}"),
-            "Filter: b IN ([UInt32(1), UInt32(2), UInt32(3), UInt32(4)])\
-            \n  Projection: test.a AS b, test.c\
-            \n    TableScan: test\
-            "
+        assert_snapshot!(plan,
+        @r"
+        Filter: b IN ([UInt32(1), UInt32(2), UInt32(3), UInt32(4)])
+          Projection: test.a AS b, test.c
+            TableScan: test
+        ",
         );
-
         // rewrite filter col b to test.a
-        let expected = "\
-            Projection: test.a AS b, test.c\
-            \n  TableScan: test, full_filters=[test.a IN ([UInt32(1), UInt32(2), UInt32(3), UInt32(4)])]";
-
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a AS b, test.c
+          TableScan: test, full_filters=[test.a IN ([UInt32(1), UInt32(2), UInt32(3), UInt32(4)])]
+        "
+        )
     }
 
     #[test]
@@ -2556,22 +3406,23 @@ Projection: a, b
             .build()?;
 
         // filter on col b
-        assert_eq!(
-            format!("{plan:?}"),
-            "Filter: b IN ([UInt32(1), UInt32(2), UInt32(3), UInt32(4)])\
-            \n  Projection: b, test.c\
-            \n    Projection: test.a AS b, test.c\
-            \n      TableScan: test\
-            "
+        assert_snapshot!(plan,
+        @r"
+        Filter: b IN ([UInt32(1), UInt32(2), UInt32(3), UInt32(4)])
+          Projection: b, test.c
+            Projection: test.a AS b, test.c
+              TableScan: test
+        ",
         );
-
         // rewrite filter col b to test.a
-        let expected = "\
-            Projection: b, test.c\
-            \n  Projection: test.a AS b, test.c\
-            \n    TableScan: test, full_filters=[test.a IN ([UInt32(1), UInt32(2), UInt32(3), UInt32(4)])]";
-
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: b, test.c
+          Projection: test.a AS b, test.c
+            TableScan: test, full_filters=[test.a IN ([UInt32(1), UInt32(2), UInt32(3), UInt32(4)])]
+        "
+        )
     }
 
     #[test]
@@ -2591,23 +3442,27 @@ Projection: a, b
             .build()?;
 
         // filter on col b in subquery
-        let expected_before = "\
-        Filter: b IN (<subquery>)\
-        \n  Subquery:\
-        \n    Projection: sq.c\
-        \n      TableScan: sq\
-        \n  Projection: test.a AS b, test.c\
-        \n    TableScan: test";
-        assert_eq!(format!("{plan:?}"), expected_before);
-
+        assert_snapshot!(plan,
+        @r"
+        Filter: b IN (<subquery>)
+          Subquery:
+            Projection: sq.c
+              TableScan: sq
+          Projection: test.a AS b, test.c
+            TableScan: test
+        ",
+        );
         // rewrite filter col b to test.a
-        let expected_after = "\
-        Projection: test.a AS b, test.c\
-        \n  TableScan: test, full_filters=[test.a IN (<subquery>)]\
-        \n    Subquery:\
-        \n      Projection: sq.c\
-        \n        TableScan: sq";
-        assert_optimized_plan_eq(plan, expected_after)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a AS b, test.c
+          TableScan: test, full_filters=[test.a IN (<subquery>)]
+            Subquery:
+              Projection: sq.c
+                TableScan: sq
+        "
+        )
     }
 
     #[test]
@@ -2622,25 +3477,31 @@ Projection: a, b
             .project(vec![col("b.a")])?
             .build()?;
 
-        let expected_before = "Projection: b.a\
-        \n  Filter: b.a = Int64(1)\
-        \n    SubqueryAlias: b\
-        \n      Projection: b.a\
-        \n        SubqueryAlias: b\
-        \n          Projection: Int64(0) AS a\
-        \n            EmptyRelation";
-        assert_eq!(format!("{plan:?}"), expected_before);
-
+        assert_snapshot!(plan,
+        @r"
+        Projection: b.a
+          Filter: b.a = Int64(1)
+            SubqueryAlias: b
+              Projection: b.a
+                SubqueryAlias: b
+                  Projection: Int64(0) AS a
+                    EmptyRelation: rows=1
+        ",
+        );
         // Ensure that the predicate without any columns (0 = 1) is
         // still there.
-        let expected_after = "Projection: b.a\
-        \n  SubqueryAlias: b\
-        \n    Projection: b.a\
-        \n      SubqueryAlias: b\
-        \n        Projection: Int64(0) AS a\
-        \n          Filter: Int64(0) = Int64(1)\
-        \n            EmptyRelation";
-        assert_optimized_plan_eq(plan, expected_after)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: b.a
+          SubqueryAlias: b
+            Projection: b.a
+              SubqueryAlias: b
+                Projection: Int64(0) AS a
+                  Filter: Int64(0) = Int64(1)
+                    EmptyRelation: rows=1
+        "
+        )
     }
 
     #[test]
@@ -2662,20 +3523,74 @@ Projection: a, b
             .cross_join(right)?
             .filter(filter)?
             .build()?;
-        let expected = "\
-        Inner Join:  Filter: test.a = d AND test.b > UInt32(1) OR test.b = e AND test.c < UInt32(10)\
-        \n  Projection: test.a, test.b, test.c\
-        \n    TableScan: test, full_filters=[test.b > UInt32(1) OR test.c < UInt32(10)]\
-        \n  Projection: test1.a AS d, test1.a AS e\
-        \n    TableScan: test1";
-        assert_optimized_plan_eq_with_rewrite_predicate(plan.clone(), expected)?;
+
+        assert_optimized_plan_eq_with_rewrite_predicate!(plan.clone(), @r"
+        Inner Join:  Filter: test.a = d AND test.b > UInt32(1) OR test.b = e AND test.c < UInt32(10)
+          Projection: test.a, test.b, test.c
+            TableScan: test, full_filters=[test.b > UInt32(1) OR test.c < UInt32(10)]
+          Projection: test1.a AS d, test1.a AS e
+            TableScan: test1
+        ")?;
 
         // Originally global state which can help to avoid duplicate Filters been generated and pushed down.
         // Now the global state is removed. Need to double confirm that avoid duplicate Filters.
         let optimized_plan = PushDownFilter::new()
-            .try_optimize(&plan, &OptimizerContext::new())?
-            .expect("failed to optimize plan");
-        assert_optimized_plan_eq(optimized_plan, expected)
+            .rewrite(plan, &OptimizerContext::new())
+            .expect("failed to optimize plan")
+            .data;
+        assert_optimized_plan_equal!(
+            optimized_plan,
+            @r"
+        Inner Join:  Filter: test.a = d AND test.b > UInt32(1) OR test.b = e AND test.c < UInt32(10)
+          Projection: test.a, test.b, test.c
+            TableScan: test, full_filters=[test.b > UInt32(1) OR test.c < UInt32(10)]
+          Projection: test1.a AS d, test1.a AS e
+            TableScan: test1
+        "
+        )
+    }
+
+    #[test]
+    fn left_semi_join() -> Result<()> {
+        let left = test_table_scan_with_name("test1")?;
+        let right_table_scan = test_table_scan_with_name("test2")?;
+        let right = LogicalPlanBuilder::from(right_table_scan)
+            .project(vec![col("a"), col("b")])?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(left)
+            .join(
+                right,
+                JoinType::LeftSemi,
+                (
+                    vec![Column::from_qualified_name("test1.a")],
+                    vec![Column::from_qualified_name("test2.a")],
+                ),
+                None,
+            )?
+            .filter(col("test2.a").lt_eq(lit(1i64)))?
+            .build()?;
+
+        // not part of the test, just good to know:
+        assert_snapshot!(plan,
+        @r"
+        Filter: test2.a <= Int64(1)
+          LeftSemi Join: test1.a = test2.a
+            TableScan: test1
+            Projection: test2.a, test2.b
+              TableScan: test2
+        ",
+        );
+        // Inferred the predicate `test1.a <= Int64(1)` and push it down to the left side.
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test2.a <= Int64(1)
+          LeftSemi Join: test1.a = test2.a
+            TableScan: test1, full_filters=[test1.a <= Int64(1)]
+            Projection: test2.a, test2.b
+              TableScan: test2
+        "
+        )
     }
 
     #[test]
@@ -2702,21 +3617,67 @@ Projection: a, b
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "LeftSemi Join: test1.a = test2.a Filter: test1.b > UInt32(1) AND test2.b > UInt32(2)\
-            \n  TableScan: test1\
-            \n  Projection: test2.a, test2.b\
-            \n    TableScan: test2",
+        assert_snapshot!(plan,
+        @r"
+        LeftSemi Join: test1.a = test2.a Filter: test1.b > UInt32(1) AND test2.b > UInt32(2)
+          TableScan: test1
+          Projection: test2.a, test2.b
+            TableScan: test2
+        ",
         );
-
         // Both side will be pushed down.
-        let expected = "\
-        LeftSemi Join: test1.a = test2.a\
-        \n  TableScan: test1, full_filters=[test1.b > UInt32(1)]\
-        \n  Projection: test2.a, test2.b\
-        \n    TableScan: test2, full_filters=[test2.b > UInt32(2)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        LeftSemi Join: test1.a = test2.a
+          TableScan: test1, full_filters=[test1.b > UInt32(1)]
+          Projection: test2.a, test2.b
+            TableScan: test2, full_filters=[test2.b > UInt32(2)]
+        "
+        )
+    }
+
+    #[test]
+    fn right_semi_join() -> Result<()> {
+        let left = test_table_scan_with_name("test1")?;
+        let right_table_scan = test_table_scan_with_name("test2")?;
+        let right = LogicalPlanBuilder::from(right_table_scan)
+            .project(vec![col("a"), col("b")])?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(left)
+            .join(
+                right,
+                JoinType::RightSemi,
+                (
+                    vec![Column::from_qualified_name("test1.a")],
+                    vec![Column::from_qualified_name("test2.a")],
+                ),
+                None,
+            )?
+            .filter(col("test1.a").lt_eq(lit(1i64)))?
+            .build()?;
+
+        // not part of the test, just good to know:
+        assert_snapshot!(plan,
+        @r"
+        Filter: test1.a <= Int64(1)
+          RightSemi Join: test1.a = test2.a
+            TableScan: test1
+            Projection: test2.a, test2.b
+              TableScan: test2
+        ",
+        );
+        // Inferred the predicate `test2.a <= Int64(1)` and push it down to the right side.
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test1.a <= Int64(1)
+          RightSemi Join: test1.a = test2.a
+            TableScan: test1
+            Projection: test2.a, test2.b
+              TableScan: test2, full_filters=[test2.a <= Int64(1)]
+        "
+        )
     }
 
     #[test]
@@ -2743,21 +3704,72 @@ Projection: a, b
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "RightSemi Join: test1.a = test2.a Filter: test1.b > UInt32(1) AND test2.b > UInt32(2)\
-            \n  TableScan: test1\
-            \n  Projection: test2.a, test2.b\
-            \n    TableScan: test2",
+        assert_snapshot!(plan,
+        @r"
+        RightSemi Join: test1.a = test2.a Filter: test1.b > UInt32(1) AND test2.b > UInt32(2)
+          TableScan: test1
+          Projection: test2.a, test2.b
+            TableScan: test2
+        ",
         );
-
         // Both side will be pushed down.
-        let expected = "\
-        RightSemi Join: test1.a = test2.a\
-        \n  TableScan: test1, full_filters=[test1.b > UInt32(1)]\
-        \n  Projection: test2.a, test2.b\
-        \n    TableScan: test2, full_filters=[test2.b > UInt32(2)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        RightSemi Join: test1.a = test2.a
+          TableScan: test1, full_filters=[test1.b > UInt32(1)]
+          Projection: test2.a, test2.b
+            TableScan: test2, full_filters=[test2.b > UInt32(2)]
+        "
+        )
+    }
+
+    #[test]
+    fn left_anti_join() -> Result<()> {
+        let table_scan = test_table_scan_with_name("test1")?;
+        let left = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("a"), col("b")])?
+            .build()?;
+        let right_table_scan = test_table_scan_with_name("test2")?;
+        let right = LogicalPlanBuilder::from(right_table_scan)
+            .project(vec![col("a"), col("b")])?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(left)
+            .join(
+                right,
+                JoinType::LeftAnti,
+                (
+                    vec![Column::from_qualified_name("test1.a")],
+                    vec![Column::from_qualified_name("test2.a")],
+                ),
+                None,
+            )?
+            .filter(col("test2.a").gt(lit(2u32)))?
+            .build()?;
+
+        // not part of the test, just good to know:
+        assert_snapshot!(plan,
+        @r"
+        Filter: test2.a > UInt32(2)
+          LeftAnti Join: test1.a = test2.a
+            Projection: test1.a, test1.b
+              TableScan: test1
+            Projection: test2.a, test2.b
+              TableScan: test2
+        ",
+        );
+        // For left anti, filter of the right side filter can be pushed down.
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test2.a > UInt32(2)
+          LeftAnti Join: test1.a = test2.a
+            Projection: test1.a, test1.b
+              TableScan: test1, full_filters=[test1.a > UInt32(2)]
+            Projection: test2.a, test2.b
+              TableScan: test2
+        "
+        )
     }
 
     #[test]
@@ -2787,23 +3799,74 @@ Projection: a, b
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "LeftAnti Join: test1.a = test2.a Filter: test1.b > UInt32(1) AND test2.b > UInt32(2)\
-            \n  Projection: test1.a, test1.b\
-            \n    TableScan: test1\
-            \n  Projection: test2.a, test2.b\
-            \n    TableScan: test2",
+        assert_snapshot!(plan,
+        @r"
+        LeftAnti Join: test1.a = test2.a Filter: test1.b > UInt32(1) AND test2.b > UInt32(2)
+          Projection: test1.a, test1.b
+            TableScan: test1
+          Projection: test2.a, test2.b
+            TableScan: test2
+        ",
         );
-
         // For left anti, filter of the right side filter can be pushed down.
-        let expected = "\
-        LeftAnti Join: test1.a = test2.a Filter: test1.b > UInt32(1)\
-        \n  Projection: test1.a, test1.b\
-        \n    TableScan: test1\
-        \n  Projection: test2.a, test2.b\
-        \n    TableScan: test2, full_filters=[test2.b > UInt32(2)]";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        LeftAnti Join: test1.a = test2.a Filter: test1.b > UInt32(1)
+          Projection: test1.a, test1.b
+            TableScan: test1
+          Projection: test2.a, test2.b
+            TableScan: test2, full_filters=[test2.b > UInt32(2)]
+        "
+        )
+    }
+
+    #[test]
+    fn right_anti_join() -> Result<()> {
+        let table_scan = test_table_scan_with_name("test1")?;
+        let left = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("a"), col("b")])?
+            .build()?;
+        let right_table_scan = test_table_scan_with_name("test2")?;
+        let right = LogicalPlanBuilder::from(right_table_scan)
+            .project(vec![col("a"), col("b")])?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(left)
+            .join(
+                right,
+                JoinType::RightAnti,
+                (
+                    vec![Column::from_qualified_name("test1.a")],
+                    vec![Column::from_qualified_name("test2.a")],
+                ),
+                None,
+            )?
+            .filter(col("test1.a").gt(lit(2u32)))?
+            .build()?;
+
+        // not part of the test, just good to know:
+        assert_snapshot!(plan,
+        @r"
+        Filter: test1.a > UInt32(2)
+          RightAnti Join: test1.a = test2.a
+            Projection: test1.a, test1.b
+              TableScan: test1
+            Projection: test2.a, test2.b
+              TableScan: test2
+        ",
+        );
+        // For right anti, filter of the left side can be pushed down.
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: test1.a > UInt32(2)
+          RightAnti Join: test1.a = test2.a
+            Projection: test1.a, test1.b
+              TableScan: test1
+            Projection: test2.a, test2.b
+              TableScan: test2, full_filters=[test2.a > UInt32(2)]
+        "
+        )
     }
 
     #[test]
@@ -2833,25 +3896,29 @@ Projection: a, b
             .build()?;
 
         // not part of the test, just good to know:
-        assert_eq!(
-            format!("{plan:?}"),
-            "RightAnti Join: test1.a = test2.a Filter: test1.b > UInt32(1) AND test2.b > UInt32(2)\
-            \n  Projection: test1.a, test1.b\
-            \n    TableScan: test1\
-            \n  Projection: test2.a, test2.b\
-            \n    TableScan: test2",
+        assert_snapshot!(plan,
+        @r"
+        RightAnti Join: test1.a = test2.a Filter: test1.b > UInt32(1) AND test2.b > UInt32(2)
+          Projection: test1.a, test1.b
+            TableScan: test1
+          Projection: test2.a, test2.b
+            TableScan: test2
+        ",
         );
-
         // For right anti, filter of the left side can be pushed down.
-        let expected = "RightAnti Join: test1.a = test2.a Filter: test2.b > UInt32(2)\
-        \n  Projection: test1.a, test1.b\
-        \n    TableScan: test1, full_filters=[test1.b > UInt32(1)]\
-        \n  Projection: test2.a, test2.b\
-        \n    TableScan: test2";
-        assert_optimized_plan_eq(plan, expected)
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        RightAnti Join: test1.a = test2.a Filter: test2.b > UInt32(2)
+          Projection: test1.a, test1.b
+            TableScan: test1, full_filters=[test1.b > UInt32(1)]
+          Projection: test2.a, test2.b
+            TableScan: test2
+        "
+        )
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, PartialEq, Eq, Hash)]
     struct TestScalarUDF {
         signature: Signature,
     }
@@ -2872,14 +3939,14 @@ Projection: a, b
             Ok(DataType::Int32)
         }
 
-        fn invoke(&self, _args: &[ColumnarValue]) -> Result<ColumnarValue> {
+        fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
             Ok(ColumnarValue::Scalar(ScalarValue::from(1)))
         }
     }
 
     #[test]
     fn test_push_down_volatile_function_in_aggregate() -> Result<()> {
-        // SELECT t.a, t.r FROM (SELECT a, SUM(b),  TestScalarUDF()+1 AS r FROM test1 GROUP BY a) AS t WHERE t.a > 5 AND t.r > 0.5;
+        // SELECT t.a, t.r FROM (SELECT a, sum(b),  TestScalarUDF()+1 AS r FROM test1 GROUP BY a) AS t WHERE t.a > 5 AND t.r > 0.5;
         let table_scan = test_table_scan_with_name("test1")?;
         let fun = ScalarUDF::new_from_impl(TestScalarUDF {
             signature: Signature::exact(vec![], Volatility::Volatile),
@@ -2894,21 +3961,27 @@ Projection: a, b
             .project(vec![col("t.a"), col("t.r")])?
             .build()?;
 
-        let expected_before = "Projection: t.a, t.r\
-        \n  Filter: t.a > Int32(5) AND t.r > Float64(0.5)\
-        \n    SubqueryAlias: t\
-        \n      Projection: test1.a, SUM(test1.b), TestScalarUDF() + Int32(1) AS r\
-        \n        Aggregate: groupBy=[[test1.a]], aggr=[[SUM(test1.b)]]\
-        \n          TableScan: test1";
-        assert_eq!(format!("{plan:?}"), expected_before);
-
-        let expected_after = "Projection: t.a, t.r\
-        \n  SubqueryAlias: t\
-        \n    Filter: r > Float64(0.5)\
-        \n      Projection: test1.a, SUM(test1.b), TestScalarUDF() + Int32(1) AS r\
-        \n        Aggregate: groupBy=[[test1.a]], aggr=[[SUM(test1.b)]]\
-        \n          TableScan: test1, full_filters=[test1.a > Int32(5)]";
-        assert_optimized_plan_eq(plan, expected_after)
+        assert_snapshot!(plan,
+        @r"
+        Projection: t.a, t.r
+          Filter: t.a > Int32(5) AND t.r > Float64(0.5)
+            SubqueryAlias: t
+              Projection: test1.a, sum(test1.b), TestScalarUDF() + Int32(1) AS r
+                Aggregate: groupBy=[[test1.a]], aggr=[[sum(test1.b)]]
+                  TableScan: test1
+        ",
+        );
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: t.a, t.r
+          SubqueryAlias: t
+            Filter: r > Float64(0.5)
+              Projection: test1.a, sum(test1.b), TestScalarUDF() + Int32(1) AS r
+                Aggregate: groupBy=[[test1.a]], aggr=[[sum(test1.b)]]
+                  TableScan: test1, full_filters=[test1.a > Int32(5)]
+        "
+        )
     }
 
     #[test]
@@ -2938,22 +4011,215 @@ Projection: a, b
             .project(vec![col("t.a"), col("t.r")])?
             .build()?;
 
-        let expected_before = "Projection: t.a, t.r\
-        \n  Filter: t.r > Float64(0.8)\
-        \n    SubqueryAlias: t\
-        \n      Projection: test1.a AS a, TestScalarUDF() AS r\
-        \n        Inner Join: test1.a = test2.a\
-        \n          TableScan: test1\
-        \n          TableScan: test2";
-        assert_eq!(format!("{plan:?}"), expected_before);
+        assert_snapshot!(plan,
+        @r"
+        Projection: t.a, t.r
+          Filter: t.r > Float64(0.8)
+            SubqueryAlias: t
+              Projection: test1.a AS a, TestScalarUDF() AS r
+                Inner Join: test1.a = test2.a
+                  TableScan: test1
+                  TableScan: test2
+        ",
+        );
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: t.a, t.r
+          SubqueryAlias: t
+            Filter: r > Float64(0.8)
+              Projection: test1.a AS a, TestScalarUDF() AS r
+                Inner Join: test1.a = test2.a
+                  TableScan: test1
+                  TableScan: test2
+        "
+        )
+    }
 
-        let expected = "Projection: t.a, t.r\
-        \n  SubqueryAlias: t\
-        \n    Filter: r > Float64(0.8)\
-        \n      Projection: test1.a AS a, TestScalarUDF() AS r\
-        \n        Inner Join: test1.a = test2.a\
-        \n          TableScan: test1\
-        \n          TableScan: test2";
-        assert_optimized_plan_eq(plan, expected)
+    #[test]
+    fn test_push_down_volatile_table_scan() -> Result<()> {
+        // SELECT test.a, test.b FROM test as t WHERE TestScalarUDF() > 0.1;
+        let table_scan = test_table_scan()?;
+        let fun = ScalarUDF::new_from_impl(TestScalarUDF {
+            signature: Signature::exact(vec![], Volatility::Volatile),
+        });
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(Arc::new(fun), vec![]));
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("a"), col("b")])?
+            .filter(expr.gt(lit(0.1)))?
+            .build()?;
+
+        assert_snapshot!(plan,
+        @r"
+        Filter: TestScalarUDF() > Float64(0.1)
+          Projection: test.a, test.b
+            TableScan: test
+        ",
+        );
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a, test.b
+          Filter: TestScalarUDF() > Float64(0.1)
+            TableScan: test
+        "
+        )
+    }
+
+    #[test]
+    fn test_push_down_volatile_mixed_table_scan() -> Result<()> {
+        // SELECT test.a, test.b FROM test as t WHERE TestScalarUDF() > 0.1 and test.a > 5 and test.b > 10;
+        let table_scan = test_table_scan()?;
+        let fun = ScalarUDF::new_from_impl(TestScalarUDF {
+            signature: Signature::exact(vec![], Volatility::Volatile),
+        });
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(Arc::new(fun), vec![]));
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .project(vec![col("a"), col("b")])?
+            .filter(
+                expr.gt(lit(0.1))
+                    .and(col("t.a").gt(lit(5)))
+                    .and(col("t.b").gt(lit(10))),
+            )?
+            .build()?;
+
+        assert_snapshot!(plan,
+        @r"
+        Filter: TestScalarUDF() > Float64(0.1) AND t.a > Int32(5) AND t.b > Int32(10)
+          Projection: test.a, test.b
+            TableScan: test
+        ",
+        );
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: test.a, test.b
+          Filter: TestScalarUDF() > Float64(0.1)
+            TableScan: test, full_filters=[t.a > Int32(5), t.b > Int32(10)]
+        "
+        )
+    }
+
+    #[test]
+    fn test_push_down_volatile_mixed_unsupported_table_scan() -> Result<()> {
+        // SELECT test.a, test.b FROM test as t WHERE TestScalarUDF() > 0.1 and test.a > 5 and test.b > 10;
+        let fun = ScalarUDF::new_from_impl(TestScalarUDF {
+            signature: Signature::exact(vec![], Volatility::Volatile),
+        });
+        let expr = Expr::ScalarFunction(ScalarFunction::new_udf(Arc::new(fun), vec![]));
+        let plan = table_scan_with_pushdown_provider_builder(
+            TableProviderFilterPushDown::Unsupported,
+            vec![],
+            None,
+        )?
+        .project(vec![col("a"), col("b")])?
+        .filter(
+            expr.gt(lit(0.1))
+                .and(col("t.a").gt(lit(5)))
+                .and(col("t.b").gt(lit(10))),
+        )?
+        .build()?;
+
+        assert_snapshot!(plan,
+        @r"
+        Filter: TestScalarUDF() > Float64(0.1) AND t.a > Int32(5) AND t.b > Int32(10)
+          Projection: a, b
+            TableScan: test
+        ",
+        );
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: a, b
+          Filter: t.a > Int32(5) AND t.b > Int32(10) AND TestScalarUDF() > Float64(0.1)
+            TableScan: test
+        "
+        )
+    }
+
+    #[test]
+    fn test_push_down_filter_to_user_defined_node() -> Result<()> {
+        // Define a custom user-defined logical node
+        #[derive(Debug, Hash, Eq, PartialEq)]
+        struct TestUserNode {
+            schema: DFSchemaRef,
+        }
+
+        impl PartialOrd for TestUserNode {
+            fn partial_cmp(&self, _other: &Self) -> Option<Ordering> {
+                None
+            }
+        }
+
+        impl TestUserNode {
+            fn new() -> Self {
+                let schema = Arc::new(
+                    DFSchema::new_with_metadata(
+                        vec![(None, Field::new("a", DataType::Int64, false).into())],
+                        Default::default(),
+                    )
+                    .unwrap(),
+                );
+
+                Self { schema }
+            }
+        }
+
+        impl UserDefinedLogicalNodeCore for TestUserNode {
+            fn name(&self) -> &str {
+                "test_node"
+            }
+
+            fn inputs(&self) -> Vec<&LogicalPlan> {
+                vec![]
+            }
+
+            fn schema(&self) -> &DFSchemaRef {
+                &self.schema
+            }
+
+            fn expressions(&self) -> Vec<Expr> {
+                vec![]
+            }
+
+            fn fmt_for_explain(&self, f: &mut Formatter) -> std::fmt::Result {
+                write!(f, "TestUserNode")
+            }
+
+            fn with_exprs_and_inputs(
+                &self,
+                exprs: Vec<Expr>,
+                inputs: Vec<LogicalPlan>,
+            ) -> Result<Self> {
+                assert!(exprs.is_empty());
+                assert!(inputs.is_empty());
+                Ok(Self {
+                    schema: Arc::clone(&self.schema),
+                })
+            }
+        }
+
+        // Create a node and build a plan with a filter
+        let node = LogicalPlan::Extension(Extension {
+            node: Arc::new(TestUserNode::new()),
+        });
+
+        let plan = LogicalPlanBuilder::from(node).filter(lit(false))?.build()?;
+
+        // Check the original plan format (not part of the test assertions)
+        assert_snapshot!(plan,
+        @r"
+        Filter: Boolean(false)
+          TestUserNode
+        ",
+        );
+        // Check that the filter is pushed down to the user-defined node
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Filter: Boolean(false)
+          TestUserNode
+        "
+        )
     }
 }

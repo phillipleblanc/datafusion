@@ -17,11 +17,12 @@
 
 //! Utility functions for expression simplification
 
-use datafusion_common::{internal_err, Result, ScalarValue};
+use arrow::datatypes::i256;
+use datafusion_common::{Result, ScalarValue, internal_err};
 use datafusion_expr::{
-    expr::{Between, BinaryExpr, InList, ScalarFunction},
-    expr_fn::{and, bitwise_and, bitwise_or, concat_ws, or},
-    lit, BuiltinScalarFunction, Expr, Like, Operator,
+    Case, Expr, Like, Operator,
+    expr::{Between, BinaryExpr, InList},
+    expr_fn::{and, bitwise_and, bitwise_or, or},
 };
 
 pub static POWS_OF_TEN: [i128; 38] = [
@@ -67,14 +68,19 @@ pub static POWS_OF_TEN: [i128; 38] = [
 
 /// returns true if `needle` is found in a chain of search_op
 /// expressions. Such as: (A AND B) AND C
-pub fn expr_contains(expr: &Expr, needle: &Expr, search_op: Operator) -> bool {
+fn expr_contains_inner(expr: &Expr, needle: &Expr, search_op: Operator) -> bool {
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == search_op => {
-            expr_contains(left, needle, search_op)
-                || expr_contains(right, needle, search_op)
+            expr_contains_inner(left, needle, search_op)
+                || expr_contains_inner(right, needle, search_op)
         }
         _ => expr == needle,
     }
+}
+
+/// check volatile calls and return if expr contains needle
+pub fn expr_contains(expr: &Expr, needle: &Expr, search_op: Operator) -> bool {
+    expr_contains_inner(expr, needle, search_op) && !needle.is_volatile()
 }
 
 /// Deletes all 'needles' or remains one 'needle' that are found in a chain of xor
@@ -134,39 +140,51 @@ pub fn delete_xor_in_complex_expr(expr: &Expr, needle: &Expr, is_left: bool) -> 
 
 pub fn is_zero(s: &Expr) -> bool {
     match s {
-        Expr::Literal(ScalarValue::Int8(Some(0)))
-        | Expr::Literal(ScalarValue::Int16(Some(0)))
-        | Expr::Literal(ScalarValue::Int32(Some(0)))
-        | Expr::Literal(ScalarValue::Int64(Some(0)))
-        | Expr::Literal(ScalarValue::UInt8(Some(0)))
-        | Expr::Literal(ScalarValue::UInt16(Some(0)))
-        | Expr::Literal(ScalarValue::UInt32(Some(0)))
-        | Expr::Literal(ScalarValue::UInt64(Some(0))) => true,
-        Expr::Literal(ScalarValue::Float32(Some(v))) if *v == 0. => true,
-        Expr::Literal(ScalarValue::Float64(Some(v))) if *v == 0. => true,
-        Expr::Literal(ScalarValue::Decimal128(Some(v), _p, _s)) if *v == 0 => true,
+        Expr::Literal(ScalarValue::Int8(Some(0)), _)
+        | Expr::Literal(ScalarValue::Int16(Some(0)), _)
+        | Expr::Literal(ScalarValue::Int32(Some(0)), _)
+        | Expr::Literal(ScalarValue::Int64(Some(0)), _)
+        | Expr::Literal(ScalarValue::UInt8(Some(0)), _)
+        | Expr::Literal(ScalarValue::UInt16(Some(0)), _)
+        | Expr::Literal(ScalarValue::UInt32(Some(0)), _)
+        | Expr::Literal(ScalarValue::UInt64(Some(0)), _) => true,
+        Expr::Literal(ScalarValue::Float32(Some(v)), _) if *v == 0. => true,
+        Expr::Literal(ScalarValue::Float64(Some(v)), _) if *v == 0. => true,
+        Expr::Literal(ScalarValue::Decimal128(Some(v), _p, _s), _) if *v == 0 => true,
+        Expr::Literal(ScalarValue::Decimal256(Some(v), _p, _s), _)
+            if *v == i256::ZERO =>
+        {
+            true
+        }
         _ => false,
     }
 }
 
 pub fn is_one(s: &Expr) -> bool {
     match s {
-        Expr::Literal(ScalarValue::Int8(Some(1)))
-        | Expr::Literal(ScalarValue::Int16(Some(1)))
-        | Expr::Literal(ScalarValue::Int32(Some(1)))
-        | Expr::Literal(ScalarValue::Int64(Some(1)))
-        | Expr::Literal(ScalarValue::UInt8(Some(1)))
-        | Expr::Literal(ScalarValue::UInt16(Some(1)))
-        | Expr::Literal(ScalarValue::UInt32(Some(1)))
-        | Expr::Literal(ScalarValue::UInt64(Some(1))) => true,
-        Expr::Literal(ScalarValue::Float32(Some(v))) if *v == 1. => true,
-        Expr::Literal(ScalarValue::Float64(Some(v))) if *v == 1. => true,
-        Expr::Literal(ScalarValue::Decimal128(Some(v), _p, s)) => {
+        Expr::Literal(ScalarValue::Int8(Some(1)), _)
+        | Expr::Literal(ScalarValue::Int16(Some(1)), _)
+        | Expr::Literal(ScalarValue::Int32(Some(1)), _)
+        | Expr::Literal(ScalarValue::Int64(Some(1)), _)
+        | Expr::Literal(ScalarValue::UInt8(Some(1)), _)
+        | Expr::Literal(ScalarValue::UInt16(Some(1)), _)
+        | Expr::Literal(ScalarValue::UInt32(Some(1)), _)
+        | Expr::Literal(ScalarValue::UInt64(Some(1)), _) => true,
+        Expr::Literal(ScalarValue::Float32(Some(v)), _) if *v == 1. => true,
+        Expr::Literal(ScalarValue::Float64(Some(v)), _) if *v == 1. => true,
+        Expr::Literal(ScalarValue::Decimal128(Some(v), _p, s), _) => {
             *s >= 0
                 && POWS_OF_TEN
                     .get(*s as usize)
                     .map(|x| x == v)
                     .unwrap_or_default()
+        }
+        Expr::Literal(ScalarValue::Decimal256(Some(v), _p, s), _) => {
+            *s >= 0
+                && match i256::from(10).checked_pow(*s as u32) {
+                    Some(res) => res == *v,
+                    None => false,
+                }
         }
         _ => false,
     }
@@ -174,7 +192,7 @@ pub fn is_one(s: &Expr) -> bool {
 
 pub fn is_true(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(ScalarValue::Boolean(Some(v))) => *v,
+        Expr::Literal(ScalarValue::Boolean(Some(v)), _) => *v,
         _ => false,
     }
 }
@@ -182,31 +200,50 @@ pub fn is_true(expr: &Expr) -> bool {
 /// returns true if expr is a
 /// `Expr::Literal(ScalarValue::Boolean(v))` , false otherwise
 pub fn is_bool_lit(expr: &Expr) -> bool {
-    matches!(expr, Expr::Literal(ScalarValue::Boolean(_)))
+    matches!(expr, Expr::Literal(ScalarValue::Boolean(_), _))
 }
 
 /// Return a literal NULL value of Boolean data type
 pub fn lit_bool_null() -> Expr {
-    Expr::Literal(ScalarValue::Boolean(None))
+    Expr::Literal(ScalarValue::Boolean(None), None)
 }
 
 pub fn is_null(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(v) => v.is_null(),
+        Expr::Literal(v, _) => v.is_null(),
         _ => false,
     }
 }
 
 pub fn is_false(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(ScalarValue::Boolean(Some(v))) => !(*v),
+        Expr::Literal(ScalarValue::Boolean(Some(v)), _) => !(*v),
         _ => false,
     }
 }
 
 /// returns true if `haystack` looks like (needle OP X) or (X OP needle)
 pub fn is_op_with(target_op: Operator, haystack: &Expr, needle: &Expr) -> bool {
-    matches!(haystack, Expr::BinaryExpr(BinaryExpr { left, op, right }) if op == &target_op && (needle == left.as_ref() || needle == right.as_ref()))
+    matches!(haystack, Expr::BinaryExpr(BinaryExpr { left, op, right }) if op == &target_op && (needle == left.as_ref() || needle == right.as_ref()) && !needle.is_volatile())
+}
+
+pub fn can_reduce_to_equal_statement(haystack: &Expr, needle: &Expr) -> bool {
+    match (haystack, needle) {
+        // a >= constant and constant <= a => a = constant
+        (
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::GtEq,
+                right,
+            }),
+            Expr::BinaryExpr(BinaryExpr {
+                left: n_left,
+                op: Operator::LtEq,
+                right: n_right,
+            }),
+        ) if left == n_left && right == n_right => true,
+        _ => false,
+    }
 }
 
 /// returns true if `not_expr` is !`expr` (not)
@@ -221,11 +258,36 @@ pub fn is_negative_of(not_expr: &Expr, expr: &Expr) -> bool {
 
 /// returns the contained boolean value in `expr` as
 /// `Expr::Literal(ScalarValue::Boolean(v))`.
-pub fn as_bool_lit(expr: Expr) -> Result<Option<bool>> {
+pub fn as_bool_lit(expr: &Expr) -> Result<Option<bool>> {
     match expr {
-        Expr::Literal(ScalarValue::Boolean(v)) => Ok(v),
+        Expr::Literal(ScalarValue::Boolean(v), _) => Ok(*v),
         _ => internal_err!("Expected boolean literal, got {expr:?}"),
     }
+}
+
+pub fn is_case_with_literal_outputs(expr: &Expr) -> bool {
+    match expr {
+        Expr::Case(Case {
+            expr: None,
+            when_then_expr,
+            else_expr,
+        }) => {
+            when_then_expr.iter().all(|(_, then)| is_lit(then))
+                && else_expr.as_deref().is_none_or(is_lit)
+        }
+        _ => false,
+    }
+}
+
+pub fn into_case(expr: Expr) -> Result<Case> {
+    match expr {
+        Expr::Case(case) => Ok(case),
+        _ => internal_err!("Expected case, got {expr:?}"),
+    }
+}
+
+pub fn is_lit(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(_, _))
 }
 
 /// negate a Not clause
@@ -342,119 +404,77 @@ pub fn distribute_negation(expr: Expr) -> Expr {
     }
 }
 
-/// Simplify the `concat` function by
-/// 1. filtering out all `null` literals
-/// 2. concatenating contiguous literal arguments
-///
-/// For example:
-/// `concat(col(a), 'hello ', 'world', col(b), null)`
-/// will be optimized to
-/// `concat(col(a), 'hello world', col(b))`
-pub fn simpl_concat(args: Vec<Expr>) -> Result<Expr> {
-    let mut new_args = Vec::with_capacity(args.len());
-    let mut contiguous_scalar = "".to_string();
-    for arg in args {
-        match arg {
-            // filter out `null` args
-            Expr::Literal(ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None)) => {}
-            // All literals have been converted to Utf8 or LargeUtf8 in type_coercion.
-            // Concatenate it with the `contiguous_scalar`.
-            Expr::Literal(
-                ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)),
-            ) => contiguous_scalar += &v,
-            Expr::Literal(x) => {
-                return internal_err!(
-                "The scalar {x} should be casted to string type during the type coercion."
-            )
-            }
-            // If the arg is not a literal, we should first push the current `contiguous_scalar`
-            // to the `new_args` (if it is not empty) and reset it to empty string.
-            // Then pushing this arg to the `new_args`.
-            arg => {
-                if !contiguous_scalar.is_empty() {
-                    new_args.push(lit(contiguous_scalar));
-                    contiguous_scalar = "".to_string();
-                }
-                new_args.push(arg);
-            }
-        }
-    }
-    if !contiguous_scalar.is_empty() {
-        new_args.push(lit(contiguous_scalar));
+#[cfg(test)]
+mod tests {
+    use super::{is_one, is_zero};
+    use arrow::datatypes::i256;
+    use datafusion_common::ScalarValue;
+    use datafusion_expr::lit;
+
+    #[test]
+    fn test_is_zero() {
+        assert!(is_zero(&lit(ScalarValue::Int8(Some(0)))));
+        assert!(is_zero(&lit(ScalarValue::Float32(Some(0.0)))));
+        assert!(is_zero(&lit(ScalarValue::Decimal128(
+            Some(i128::from(0)),
+            9,
+            0
+        ))));
+        assert!(is_zero(&lit(ScalarValue::Decimal128(
+            Some(i128::from(0)),
+            9,
+            5
+        ))));
+        assert!(is_zero(&lit(ScalarValue::Decimal256(
+            Some(i256::ZERO),
+            9,
+            0
+        ))));
+        assert!(is_zero(&lit(ScalarValue::Decimal256(
+            Some(i256::ZERO),
+            9,
+            5
+        ))));
     }
 
-    Ok(Expr::ScalarFunction(ScalarFunction::new(
-        BuiltinScalarFunction::Concat,
-        new_args,
-    )))
-}
-
-/// Simply the `concat_ws` function by
-/// 1. folding to `null` if the delimiter is null
-/// 2. filtering out `null` arguments
-/// 3. using `concat` to replace `concat_ws` if the delimiter is an empty string
-/// 4. concatenating contiguous literals if the delimiter is a literal.
-pub fn simpl_concat_ws(delimiter: &Expr, args: &[Expr]) -> Result<Expr> {
-    match delimiter {
-        Expr::Literal(
-            ScalarValue::Utf8(delimiter) | ScalarValue::LargeUtf8(delimiter),
-        ) => {
-            match delimiter {
-                // when the delimiter is an empty string,
-                // we can use `concat` to replace `concat_ws`
-                Some(delimiter) if delimiter.is_empty() => simpl_concat(args.to_vec()),
-                Some(delimiter) => {
-                    let mut new_args = Vec::with_capacity(args.len());
-                    new_args.push(lit(delimiter));
-                    let mut contiguous_scalar = None;
-                    for arg in args {
-                        match arg {
-                            // filter out null args
-                            Expr::Literal(ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None)) => {}
-                            Expr::Literal(ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v))) => {
-                                match contiguous_scalar {
-                                    None => contiguous_scalar = Some(v.to_string()),
-                                    Some(mut pre) => {
-                                        pre += delimiter;
-                                        pre += v;
-                                        contiguous_scalar = Some(pre)
-                                    }
-                                }
-                            }
-                            Expr::Literal(s) => return internal_err!("The scalar {s} should be casted to string type during the type coercion."),
-                            // If the arg is not a literal, we should first push the current `contiguous_scalar`
-                            // to the `new_args` and reset it to None.
-                            // Then pushing this arg to the `new_args`.
-                            arg => {
-                                if let Some(val) = contiguous_scalar {
-                                    new_args.push(lit(val));
-                                }
-                                new_args.push(arg.clone());
-                                contiguous_scalar = None;
-                            }
-                        }
-                    }
-                    if let Some(val) = contiguous_scalar {
-                        new_args.push(lit(val));
-                    }
-                    Ok(Expr::ScalarFunction(ScalarFunction::new(
-                        BuiltinScalarFunction::ConcatWithSeparator,
-                        new_args,
-                    )))
-                }
-                // if the delimiter is null, then the value of the whole expression is null.
-                None => Ok(Expr::Literal(ScalarValue::Utf8(None))),
-            }
-        }
-        Expr::Literal(d) => internal_err!(
-            "The scalar {d} should be casted to string type during the type coercion."
-        ),
-        d => Ok(concat_ws(
-            d.clone(),
-            args.iter()
-                .filter(|&x| !is_null(x))
-                .cloned()
-                .collect::<Vec<Expr>>(),
-        )),
+    #[test]
+    fn test_is_one() {
+        assert!(is_one(&lit(ScalarValue::Int8(Some(1)))));
+        assert!(is_one(&lit(ScalarValue::Float32(Some(1.0)))));
+        assert!(is_one(&lit(ScalarValue::Decimal128(
+            Some(i128::from(1)),
+            9,
+            0
+        ))));
+        assert!(is_one(&lit(ScalarValue::Decimal128(
+            Some(i128::from(10)),
+            9,
+            1
+        ))));
+        assert!(is_one(&lit(ScalarValue::Decimal128(
+            Some(i128::from(100)),
+            9,
+            2
+        ))));
+        assert!(is_one(&lit(ScalarValue::Decimal256(
+            Some(i256::from(1)),
+            9,
+            0
+        ))));
+        assert!(is_one(&lit(ScalarValue::Decimal256(
+            Some(i256::from(10)),
+            9,
+            1
+        ))));
+        assert!(is_one(&lit(ScalarValue::Decimal256(
+            Some(i256::from(100)),
+            9,
+            2
+        ))));
+        assert!(!is_one(&lit(ScalarValue::Decimal256(
+            Some(i256::from(100)),
+            9,
+            -1
+        ))));
     }
 }

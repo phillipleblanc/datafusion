@@ -16,17 +16,23 @@
 // under the License.
 
 use std::any::Any;
-use std::sync::Arc;
 
-use arrow::array::Float64Array;
 use arrow::datatypes::DataType;
 use arrow::datatypes::DataType::Float64;
+use datafusion_common::{Result, ScalarValue, assert_or_internal_err};
+use datafusion_expr::sort_properties::{ExprProperties, SortProperties};
+use datafusion_expr::{
+    ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
+    Volatility,
+};
+use datafusion_macros::user_doc;
 
-use datafusion_common::{exec_err, Result};
-use datafusion_expr::{ColumnarValue, FuncMonotonicity, Volatility};
-use datafusion_expr::{ScalarUDFImpl, Signature};
-
-#[derive(Debug)]
+#[user_doc(
+    doc_section(label = "Math Functions"),
+    description = "Returns an approximate value of π.",
+    syntax_example = "pi()"
+)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct PiFunc {
     signature: Signature,
 }
@@ -40,7 +46,7 @@ impl Default for PiFunc {
 impl PiFunc {
     pub fn new() -> Self {
         Self {
-            signature: Signature::exact(vec![], Volatility::Immutable),
+            signature: Signature::nullary(Volatility::Immutable),
         }
     }
 }
@@ -62,15 +68,23 @@ impl ScalarUDFImpl for PiFunc {
         Ok(Float64)
     }
 
-    fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
-        if !matches!(&args[0], ColumnarValue::Array(_)) {
-            return exec_err!("Expect pi function to take no param");
-        }
-        let array = Float64Array::from_value(std::f64::consts::PI, 1);
-        Ok(ColumnarValue::Array(Arc::new(array)))
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        assert_or_internal_err!(
+            args.args.is_empty(),
+            "{} function does not accept arguments",
+            self.name()
+        );
+        Ok(ColumnarValue::Scalar(ScalarValue::Float64(Some(
+            std::f64::consts::PI,
+        ))))
     }
 
-    fn monotonicity(&self) -> Result<Option<FuncMonotonicity>> {
-        Ok(Some(vec![Some(true)]))
+    fn output_ordering(&self, _input: &[ExprProperties]) -> Result<SortProperties> {
+        // This function returns a constant value.
+        Ok(SortProperties::Singleton)
+    }
+
+    fn documentation(&self) -> Option<&Documentation> {
+        self.doc()
     }
 }

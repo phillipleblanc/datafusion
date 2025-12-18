@@ -17,16 +17,19 @@
 
 //! A custom binary heap implementation for performant top K aggregation
 
-use arrow::datatypes::i256;
-use arrow_array::cast::AsArray;
-use arrow_array::{downcast_primitive, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
-use arrow_schema::DataType;
-use datafusion_common::DataFusionError;
+use arrow::array::{ArrayRef, ArrowPrimitiveType, PrimitiveArray, downcast_primitive};
+use arrow::array::{
+    cast::AsArray,
+    types::{IntervalDayTime, IntervalMonthDayNano},
+};
+use arrow::buffer::ScalarBuffer;
+use arrow::datatypes::{DataType, i256};
 use datafusion_common::Result;
-use datafusion_physical_expr::aggregate::utils::adjust_output_array;
+use datafusion_common::exec_datafusion_err;
+
 use half::f16;
 use std::cmp::Ordering;
-use std::fmt::{Debug, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 
 /// A custom version of `Ord` that only exists to we can implement it for the Values in our heap
@@ -150,10 +153,11 @@ where
     }
 
     fn drain(&mut self) -> (ArrayRef, Vec<usize>) {
+        let nulls = None;
         let (vals, map_idxs) = self.heap.drain();
-        let vals = Arc::new(PrimitiveArray::<VAL>::from_iter_values(vals));
-        let vals = adjust_output_array(&self.data_type, vals).expect("Type is incorrect");
-        (vals, map_idxs)
+        let arr = PrimitiveArray::<VAL>::new(ScalarBuffer::from(vals), nulls)
+            .with_data_type(self.data_type.clone());
+        (Arc::new(arr), map_idxs)
     }
 }
 
@@ -307,13 +311,12 @@ impl<VAL: ValueType> TopKHeap<VAL> {
         let mut best_idx = node_idx;
         let mut best_val = &entry.val;
         for child_idx in left_child..=left_child + 1 {
-            if let Some(Some(child)) = self.heap.get(child_idx) {
-                if (!desc && child.val.comp(best_val) == Ordering::Greater)
-                    || (desc && child.val.comp(best_val) == Ordering::Less)
-                {
-                    best_val = &child.val;
-                    best_idx = child_idx;
-                }
+            if let Some(Some(child)) = self.heap.get(child_idx)
+                && ((!desc && child.val.comp(best_val) == Ordering::Greater)
+                    || (desc && child.val.comp(best_val) == Ordering::Less))
+            {
+                best_val = &child.val;
+                best_idx = child_idx;
             }
         }
         if best_val.comp(&entry.val) != Ordering::Equal {
@@ -322,29 +325,43 @@ impl<VAL: ValueType> TopKHeap<VAL> {
         }
     }
 
-    #[cfg(test)]
-    fn _tree_print(&self, idx: usize) -> Option<termtree::Tree<String>> {
-        let hi = self.heap.get(idx)?;
-        match hi {
-            None => None,
-            Some(hi) => {
-                let label =
-                    format!("val={:?} idx={}, bucket={}", hi.val, idx, hi.map_idx);
-                let left = self._tree_print(idx * 2 + 1);
-                let right = self._tree_print(idx * 2 + 2);
-                let children = left.into_iter().chain(right);
-                let me = termtree::Tree::new(label).with_leaves(children);
-                Some(me)
+    fn _tree_print(&self, idx: usize, prefix: &str, is_tail: bool, output: &mut String) {
+        if let Some(Some(hi)) = self.heap.get(idx) {
+            let connector = if idx != 0 {
+                if is_tail { "└── " } else { "├── " }
+            } else {
+                ""
+            };
+            output.push_str(&format!(
+                "{}{}val={:?} idx={}, bucket={}\n",
+                prefix, connector, hi.val, idx, hi.map_idx
+            ));
+            let new_prefix = if is_tail { "" } else { "│   " };
+            let child_prefix = format!("{prefix}{new_prefix}");
+
+            let left_idx = idx * 2 + 1;
+            let right_idx = idx * 2 + 2;
+
+            let left_exists = left_idx < self.len;
+            let right_exists = right_idx < self.len;
+
+            if left_exists {
+                self._tree_print(left_idx, &child_prefix, !right_exists, output);
+            }
+            if right_exists {
+                self._tree_print(right_idx, &child_prefix, true, output);
             }
         }
     }
+}
 
-    #[cfg(test)]
-    fn tree_print(&self) -> String {
-        match self._tree_print(0) {
-            None => "".to_string(),
-            Some(root) => format!("{}", root),
+impl<VAL: ValueType> Display for TopKHeap<VAL> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut output = String::new();
+        if !self.heap.is_empty() {
+            self._tree_print(0, "", true, &mut output);
         }
+        write!(f, "{output}")
     }
 }
 
@@ -360,9 +377,9 @@ impl<VAL: ValueType> HeapItem<VAL> {
 impl<VAL: ValueType> Debug for HeapItem<VAL> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str("bucket=")?;
-        self.map_idx.fmt(f)?;
+        Debug::fmt(&self.map_idx, f)?;
         f.write_str(" val=")?;
-        self.val.fmt(f)?;
+        Debug::fmt(&self.val, f)?;
         f.write_str("\n")?;
         Ok(())
     }
@@ -431,9 +448,14 @@ macro_rules! compare_integer {
 
 compare_integer!(i8, i16, i32, i64, i128, i256);
 compare_integer!(u8, u16, u32, u64);
+compare_integer!(IntervalDayTime, IntervalMonthDayNano);
 compare_float!(f16, f32, f64);
 
-pub fn new_heap(limit: usize, desc: bool, vt: DataType) -> Result<Box<dyn ArrowHeap>> {
+pub fn new_heap(
+    limit: usize,
+    desc: bool,
+    vt: DataType,
+) -> Result<Box<dyn ArrowHeap + Send>> {
     macro_rules! downcast_helper {
         ($vt:ty, $d:ident) => {
             return Ok(Box::new(PrimitiveHeap::<$vt>::new(limit, desc, vt)))
@@ -445,15 +467,14 @@ pub fn new_heap(limit: usize, desc: bool, vt: DataType) -> Result<Box<dyn ArrowH
         _ => {}
     }
 
-    Err(DataFusionError::Execution(format!(
-        "Can't group type: {vt:?}"
-    )))
+    Err(exec_datafusion_err!("Can't group type: {vt:?}"))
 }
 
 #[cfg(test)]
 mod tests {
+    use insta::assert_snapshot;
+
     use super::*;
-    use datafusion_common::Result;
 
     #[test]
     fn should_append() -> Result<()> {
@@ -461,11 +482,10 @@ mod tests {
         let mut heap = TopKHeap::new(10, false);
         heap.append_or_replace(1, 1, &mut map);
 
-        let actual = heap.tree_print();
-        let expected = r#"
+        let actual = heap.to_string();
+        assert_snapshot!(actual, @r#"
 val=1 idx=0, bucket=1
-        "#;
-        assert_eq!(actual.trim(), expected.trim());
+            "#);
 
         Ok(())
     }
@@ -481,12 +501,11 @@ val=1 idx=0, bucket=1
         heap.append_or_replace(2, 2, &mut map);
         assert_eq!(map, vec![(2, 0), (1, 1)]);
 
-        let actual = heap.tree_print();
-        let expected = r#"
+        let actual = heap.to_string();
+        assert_snapshot!(actual, @r#"
 val=2 idx=0, bucket=2
 └── val=1 idx=1, bucket=1
-        "#;
-        assert_eq!(actual.trim(), expected.trim());
+            "#);
 
         Ok(())
     }
@@ -499,23 +518,21 @@ val=2 idx=0, bucket=2
         heap.append_or_replace(1, 1, &mut map);
         heap.append_or_replace(2, 2, &mut map);
         heap.append_or_replace(3, 3, &mut map);
-        let actual = heap.tree_print();
-        let expected = r#"
+        let actual = heap.to_string();
+        assert_snapshot!(actual, @r#"
 val=3 idx=0, bucket=3
 ├── val=1 idx=1, bucket=1
 └── val=2 idx=2, bucket=2
-        "#;
-        assert_eq!(actual.trim(), expected.trim());
+            "#);
 
         let mut map = vec![];
         heap.append_or_replace(0, 0, &mut map);
-        let actual = heap.tree_print();
-        let expected = r#"
+        let actual = heap.to_string();
+        assert_snapshot!(actual, @r#"
 val=2 idx=0, bucket=2
 ├── val=1 idx=1, bucket=1
 └── val=0 idx=2, bucket=0
-        "#;
-        assert_eq!(actual.trim(), expected.trim());
+            "#);
         assert_eq!(map, vec![(2, 0), (0, 2)]);
 
         Ok(())
@@ -530,25 +547,23 @@ val=2 idx=0, bucket=2
         heap.append_or_replace(2, 2, &mut map);
         heap.append_or_replace(3, 3, &mut map);
         heap.append_or_replace(4, 4, &mut map);
-        let actual = heap.tree_print();
-        let expected = r#"
+        let actual = heap.to_string();
+        assert_snapshot!(actual, @r#"
 val=4 idx=0, bucket=4
 ├── val=3 idx=1, bucket=3
 │   └── val=1 idx=3, bucket=1
 └── val=2 idx=2, bucket=2
-        "#;
-        assert_eq!(actual.trim(), expected.trim());
+            "#);
 
         let mut map = vec![];
         heap.replace_if_better(1, 0, &mut map);
-        let actual = heap.tree_print();
-        let expected = r#"
+        let actual = heap.to_string();
+        assert_snapshot!(actual, @r#"
 val=4 idx=0, bucket=4
 ├── val=1 idx=1, bucket=1
 │   └── val=0 idx=3, bucket=3
 └── val=2 idx=2, bucket=2
-        "#;
-        assert_eq!(actual.trim(), expected.trim());
+            "#);
         assert_eq!(map, vec![(1, 1), (3, 3)]);
 
         Ok(())
@@ -562,12 +577,11 @@ val=4 idx=0, bucket=4
         heap.append_or_replace(1, 1, &mut map);
         heap.append_or_replace(2, 2, &mut map);
 
-        let actual = heap.tree_print();
-        let expected = r#"
+        let actual = heap.to_string();
+        assert_snapshot!(actual, @r#"
 val=2 idx=0, bucket=2
 └── val=1 idx=1, bucket=1
-        "#;
-        assert_eq!(actual.trim(), expected.trim());
+            "#);
 
         assert_eq!(heap.worst_val(), Some(&2));
         assert_eq!(heap.worst_map_idx(), 2);
@@ -583,12 +597,11 @@ val=2 idx=0, bucket=2
         heap.append_or_replace(1, 1, &mut map);
         heap.append_or_replace(2, 2, &mut map);
 
-        let actual = heap.tree_print();
-        let expected = r#"
+        let actual = heap.to_string();
+        assert_snapshot!(actual, @r#"
 val=2 idx=0, bucket=2
 └── val=1 idx=1, bucket=1
-        "#;
-        assert_eq!(actual.trim(), expected.trim());
+            "#);
 
         let (vals, map_idxs) = heap.drain();
         assert_eq!(vals, vec![1, 2]);
@@ -606,21 +619,19 @@ val=2 idx=0, bucket=2
         heap.append_or_replace(1, 1, &mut map);
         heap.append_or_replace(2, 2, &mut map);
 
-        let actual = heap.tree_print();
-        let expected = r#"
+        let actual = heap.to_string();
+        assert_snapshot!(actual, @r#"
 val=2 idx=0, bucket=2
 └── val=1 idx=1, bucket=1
-        "#;
-        assert_eq!(actual.trim(), expected.trim());
+            "#);
 
         let numbers = vec![(0, 1), (1, 2)];
         heap.renumber(numbers.as_slice());
-        let actual = heap.tree_print();
-        let expected = r#"
+        let actual = heap.to_string();
+        assert_snapshot!(actual, @r#"
 val=2 idx=0, bucket=1
 └── val=1 idx=1, bucket=2
-        "#;
-        assert_eq!(actual.trim(), expected.trim());
+            "#);
 
         Ok(())
     }

@@ -15,68 +15,196 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::any::Any;
-use std::fmt::{Debug, Display};
-use std::sync::Arc;
-
-use datafusion::common::config::{
-    ConfigEntry, ConfigExtension, ConfigField, ExtensionOptions, TableOptions, Visit,
-};
-use datafusion::common::{exec_datafusion_err, exec_err, internal_err};
-use datafusion::error::{DataFusionError, Result};
-use datafusion::execution::context::SessionState;
-use datafusion::prelude::SessionContext;
+pub mod instrumented;
 
 use async_trait::async_trait;
-use aws_credential_types::provider::ProvideCredentials;
-use object_store::aws::{AmazonS3Builder, AwsCredential};
-use object_store::gcp::GoogleCloudStorageBuilder;
-use object_store::http::HttpBuilder;
-use object_store::{CredentialProvider, ObjectStore};
+use aws_config::BehaviorVersion;
+use aws_credential_types::provider::{
+    ProvideCredentials, SharedCredentialsProvider, error::CredentialsError,
+};
+use datafusion::{
+    common::{
+        config::ConfigEntry, config::ConfigExtension, config::ConfigField,
+        config::ExtensionOptions, config::TableOptions, config::Visit, config_err,
+        exec_datafusion_err, exec_err,
+    },
+    error::{DataFusionError, Result},
+    execution::context::SessionState,
+};
+use log::debug;
+use object_store::{
+    ClientOptions, CredentialProvider,
+    Error::Generic,
+    ObjectStore,
+    aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential},
+    gcp::GoogleCloudStorageBuilder,
+    http::HttpBuilder,
+};
+use std::{
+    any::Any,
+    error::Error,
+    fmt::{Debug, Display},
+    sync::Arc,
+};
 use url::Url;
+
+#[cfg(not(test))]
+use object_store::aws::resolve_bucket_region;
+
+// Provide a local mock when running tests so we don't make network calls
+#[cfg(test)]
+async fn resolve_bucket_region(
+    _bucket: &str,
+    _client_options: &ClientOptions,
+) -> object_store::Result<String> {
+    Ok("eu-central-1".to_string())
+}
 
 pub async fn get_s3_object_store_builder(
     url: &Url,
     aws_options: &AwsOptions,
+    resolve_region: bool,
 ) -> Result<AmazonS3Builder> {
+    let AwsOptions {
+        access_key_id,
+        secret_access_key,
+        session_token,
+        region,
+        endpoint,
+        allow_http,
+        skip_signature,
+    } = aws_options;
+
     let bucket_name = get_bucket_name(url)?;
     let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket_name);
 
     if let (Some(access_key_id), Some(secret_access_key)) =
-        (&aws_options.access_key_id, &aws_options.secret_access_key)
+        (access_key_id, secret_access_key)
     {
+        debug!("Using explicitly provided S3 access_key_id and secret_access_key");
         builder = builder
             .with_access_key_id(access_key_id)
             .with_secret_access_key(secret_access_key);
 
-        if let Some(session_token) = &aws_options.session_token {
+        if let Some(session_token) = session_token {
             builder = builder.with_token(session_token);
         }
     } else {
-        let config = aws_config::from_env().load().await;
-        if let Some(region) = config.region() {
-            builder = builder.with_region(region.to_string());
+        debug!("Using AWS S3 SDK to determine credentials");
+        let CredentialsFromConfig {
+            region,
+            credentials,
+        } = CredentialsFromConfig::try_new().await?;
+        if let Some(region) = region {
+            builder = builder.with_region(region);
         }
+        if let Some(credentials) = credentials {
+            let credentials = Arc::new(S3CredentialProvider { credentials });
+            builder = builder.with_credentials(credentials);
+        } else {
+            debug!("No credentials found, defaulting to skip signature ");
+            builder = builder.with_skip_signature(true);
+        }
+    }
+
+    if let Some(region) = region {
+        builder = builder.with_region(region);
+    }
+
+    // If the region is not set or auto_detect_region is true, resolve the region.
+    if builder
+        .get_config_value(&AmazonS3ConfigKey::Region)
+        .is_none()
+        || resolve_region
+    {
+        let region = resolve_bucket_region(bucket_name, &ClientOptions::new()).await?;
+        builder = builder.with_region(region);
+    }
+
+    if let Some(endpoint) = endpoint {
+        // Make a nicer error if the user hasn't allowed http and the endpoint
+        // is http as the default message is "URL scheme is not allowed"
+        if let Ok(endpoint_url) = Url::try_from(endpoint.as_str())
+            && !matches!(allow_http, Some(true))
+            && endpoint_url.scheme() == "http"
+        {
+            return config_err!(
+                "Invalid endpoint: {endpoint}. \
+                HTTP is not allowed for S3 endpoints. \
+                To allow HTTP, set 'aws.allow_http' to true"
+            );
+        }
+
+        builder = builder.with_endpoint(endpoint);
+    }
+
+    if let Some(allow_http) = allow_http {
+        builder = builder.with_allow_http(*allow_http);
+    }
+
+    if let Some(skip_signature) = skip_signature {
+        builder = builder.with_skip_signature(*skip_signature);
+    }
+
+    Ok(builder)
+}
+
+/// Credentials from the AWS SDK
+struct CredentialsFromConfig {
+    region: Option<String>,
+    credentials: Option<SharedCredentialsProvider>,
+}
+
+impl CredentialsFromConfig {
+    /// Attempt find AWS S3 credentials via the AWS SDK
+    pub async fn try_new() -> Result<Self> {
+        let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+        let region = config.region().map(|r| r.to_string());
 
         let credentials = config
             .credentials_provider()
             .ok_or_else(|| {
-                DataFusionError::ObjectStore(object_store::Error::Generic {
+                DataFusionError::ObjectStore(Box::new(Generic {
                     store: "S3",
-                    source: "Failed to get S3 credentials from the environment".into(),
-                })
+                    source: "Failed to get S3 credentials aws_config".into(),
+                }))
             })?
             .clone();
 
-        let credentials = Arc::new(S3CredentialProvider { credentials });
-        builder = builder.with_credentials(credentials);
-    }
+        // The credential provider is lazy, so it does not fetch credentials
+        // until they are needed. To ensure that the credentials are valid,
+        // we can call `provide_credentials` here.
+        let credentials = match credentials.provide_credentials().await {
+            Ok(_) => Some(credentials),
+            Err(CredentialsError::CredentialsNotLoaded(_)) => {
+                debug!("Could not use AWS SDK to get credentials");
+                None
+            }
+            // other errors like `CredentialsError::InvalidConfiguration`
+            // should be returned to the user so they can be fixed
+            Err(e) => {
+                // Pass back underlying error to the user, including underlying source
+                let source_message = if let Some(source) = e.source() {
+                    format!(": {source}")
+                } else {
+                    String::new()
+                };
 
-    if let Some(region) = &aws_options.region {
-        builder = builder.with_region(region);
-    }
+                let message = format!(
+                    "Error getting credentials from provider: {e}{source_message}",
+                );
 
-    Ok(builder)
+                return Err(DataFusionError::ObjectStore(Box::new(Generic {
+                    store: "S3",
+                    source: message.into(),
+                })));
+            }
+        };
+        Ok(Self {
+            region,
+            credentials,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -89,12 +217,14 @@ impl CredentialProvider for S3CredentialProvider {
     type Credential = AwsCredential;
 
     async fn get_credential(&self) -> object_store::Result<Arc<Self::Credential>> {
-        let creds = self.credentials.provide_credentials().await.map_err(|e| {
-            object_store::Error::Generic {
-                store: "S3",
-                source: Box::new(e),
-            }
-        })?;
+        let creds =
+            self.credentials
+                .provide_credentials()
+                .await
+                .map_err(|e| Generic {
+                    store: "S3",
+                    source: Box::new(e),
+                })?;
         Ok(Arc::new(AwsCredential {
             key_id: creds.access_key_id().to_string(),
             secret_key: creds.secret_access_key().to_string(),
@@ -168,10 +298,7 @@ pub fn get_gcs_object_store_builder(
 
 fn get_bucket_name(url: &Url) -> Result<&str> {
     url.host_str().ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "Not able to parse bucket name from url: {}",
-            url.as_str()
-        ))
+        exec_datafusion_err!("Not able to parse bucket name from url: {}", url.as_str())
     })
 }
 
@@ -188,6 +315,13 @@ pub struct AwsOptions {
     pub region: Option<String>,
     /// OSS or COS Endpoint
     pub endpoint: Option<String>,
+    /// Allow HTTP (otherwise will always use https)
+    pub allow_http: Option<bool>,
+    /// Do not fetch credentials and do not sign requests
+    ///
+    /// This can be useful when interacting with public S3 buckets that deny
+    /// authorized requests
+    pub skip_signature: Option<bool>,
 }
 
 impl ExtensionOptions for AwsOptions {
@@ -219,11 +353,17 @@ impl ExtensionOptions for AwsOptions {
             "region" => {
                 self.region.set(rem, value)?;
             }
-            "oss" | "cos" => {
+            "oss" | "cos" | "endpoint" => {
                 self.endpoint.set(rem, value)?;
             }
+            "allow_http" => {
+                self.allow_http.set(rem, value)?;
+            }
+            "skip_signature" | "nosign" => {
+                self.skip_signature.set(rem, value)?;
+            }
             _ => {
-                return internal_err!("Config value \"{}\" not found on AwsOptions", rem);
+                return config_err!("Config value \"{}\" not found on AwsOptions", rem);
             }
         }
         Ok(())
@@ -262,6 +402,7 @@ impl ExtensionOptions for AwsOptions {
         self.session_token.visit(&mut v, "session_token", "");
         self.region.visit(&mut v, "region", "");
         self.endpoint.visit(&mut v, "endpoint", "");
+        self.allow_http.visit(&mut v, "allow_http", "");
         v.0
     }
 }
@@ -307,7 +448,7 @@ impl ExtensionOptions for GcpOptions {
                 self.application_credentials_path.set(rem, value)?;
             }
             _ => {
-                return internal_err!("Config value \"{}\" not found on GcpOptions", rem);
+                return config_err!("Config value \"{}\" not found on GcpOptions", rem);
             }
         }
         Ok(())
@@ -357,53 +498,12 @@ impl ConfigExtension for GcpOptions {
     const PREFIX: &'static str = "gcp";
 }
 
-/// Registers storage options for different cloud storage schemes in a given
-/// session context.
-///
-/// This function is responsible for extending the session context with specific
-/// options based on the storage scheme being used. These options are essential
-/// for handling interactions with different cloud storage services such as Amazon
-/// S3, Alibaba Cloud OSS, Google Cloud Storage, etc.
-///
-/// # Parameters
-///
-/// * `ctx` - A mutable reference to the session context where table options are
-///   to be registered. The session context holds configuration and environment
-///   for the current session.
-/// * `scheme` - A string slice that represents the cloud storage scheme. This
-///   determines which set of options will be registered in the session context.
-///
-/// # Supported Schemes
-///
-/// * `s3` or `oss` - Registers `AwsOptions` which are configurations specific to
-///   Amazon S3 and Alibaba Cloud OSS.
-/// * `gs` or `gcs` - Registers `GcpOptions` which are configurations specific to
-///   Google Cloud Storage.
-///
-/// NOTE: This function will not perform any action when given an unsupported scheme.
-pub(crate) fn register_options(ctx: &SessionContext, scheme: &str) {
-    // Match the provided scheme against supported cloud storage schemes:
-    match scheme {
-        // For Amazon S3 or Alibaba Cloud OSS
-        "s3" | "oss" | "cos" => {
-            // Register AWS specific table options in the session context:
-            ctx.register_table_options_extension(AwsOptions::default())
-        }
-        // For Google Cloud Storage
-        "gs" | "gcs" => {
-            // Register GCP specific table options in the session context:
-            ctx.register_table_options_extension(GcpOptions::default())
-        }
-        // For unsupported schemes, do nothing:
-        _ => {}
-    }
-}
-
 pub(crate) async fn get_object_store(
     state: &SessionState,
     scheme: &str,
     url: &Url,
     table_options: &TableOptions,
+    resolve_region: bool,
 ) -> Result<Arc<dyn ObjectStore>, DataFusionError> {
     let store: Arc<dyn ObjectStore> = match scheme {
         "s3" => {
@@ -412,7 +512,8 @@ pub(crate) async fn get_object_store(
                     "Given table options incompatible with the 's3' scheme"
                 );
             };
-            let builder = get_s3_object_store_builder(url, options).await?;
+            let builder =
+                get_s3_object_store_builder(url, options, resolve_region).await?;
             Arc::new(builder.build()?)
         }
         "oss" => {
@@ -444,6 +545,7 @@ pub(crate) async fn get_object_store(
         }
         "http" | "https" => Arc::new(
             HttpBuilder::new()
+                .with_client_options(ClientOptions::new().with_allow_http(true))
                 .with_url(url.origin().ascii_serialization())
                 .build()?,
         ),
@@ -463,9 +565,10 @@ pub(crate) async fn get_object_store(
 
 #[cfg(test)]
 mod tests {
+    use crate::cli_context::CliSessionContext;
+
     use super::*;
 
-    use datafusion::common::plan_err;
     use datafusion::{
         datasource::listing::ListingTableUrl,
         logical_expr::{DdlStatement, LogicalPlan},
@@ -475,40 +578,229 @@ mod tests {
     use object_store::{aws::AmazonS3ConfigKey, gcp::GoogleConfigKey};
 
     #[tokio::test]
+    async fn s3_object_store_builder_default() -> Result<()> {
+        if let Err(DataFusionError::Execution(e)) = check_aws_envs().await {
+            // Skip test if AWS envs are not set
+            eprintln!("{e}");
+            return Ok(());
+        }
+
+        let location = "s3://bucket/path/FAKE/file.parquet";
+        // Set it to a non-existent file to avoid reading the default configuration file
+        unsafe {
+            std::env::set_var("AWS_CONFIG_FILE", "data/aws.config");
+            std::env::set_var("AWS_SHARED_CREDENTIALS_FILE", "data/aws.credentials");
+        }
+
+        // No options
+        let table_url = ListingTableUrl::parse(location)?;
+        let scheme = table_url.scheme();
+        let sql =
+            format!("CREATE EXTERNAL TABLE test STORED AS PARQUET LOCATION '{location}'");
+
+        let ctx = SessionContext::new();
+        ctx.register_table_options_extension_from_scheme(scheme);
+        let table_options = get_table_options(&ctx, &sql).await;
+        let aws_options = table_options.extensions.get::<AwsOptions>().unwrap();
+        let builder =
+            get_s3_object_store_builder(table_url.as_ref(), aws_options, false).await?;
+
+        // If the environment variables are set (as they are in CI) use them
+        let expected_access_key_id = std::env::var("AWS_ACCESS_KEY_ID").ok();
+        let expected_secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+        let expected_region = Some(
+            std::env::var("AWS_REGION").unwrap_or_else(|_| "eu-central-1".to_string()),
+        );
+        let expected_endpoint = std::env::var("AWS_ENDPOINT").ok();
+
+        // get the actual configuration information, then assert_eq!
+        assert_eq!(
+            builder.get_config_value(&AmazonS3ConfigKey::AccessKeyId),
+            expected_access_key_id
+        );
+        assert_eq!(
+            builder.get_config_value(&AmazonS3ConfigKey::SecretAccessKey),
+            expected_secret_access_key
+        );
+        // Default is to skip signature when no credentials are provided
+        let expected_skip_signature =
+            if expected_access_key_id.is_none() && expected_secret_access_key.is_none() {
+                Some(String::from("true"))
+            } else {
+                Some(String::from("false"))
+            };
+        assert_eq!(
+            builder.get_config_value(&AmazonS3ConfigKey::Region),
+            expected_region
+        );
+        assert_eq!(
+            builder.get_config_value(&AmazonS3ConfigKey::Endpoint),
+            expected_endpoint
+        );
+        assert_eq!(builder.get_config_value(&AmazonS3ConfigKey::Token), None);
+        assert_eq!(
+            builder.get_config_value(&AmazonS3ConfigKey::SkipSignature),
+            expected_skip_signature
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn s3_object_store_builder() -> Result<()> {
+        // "fake" is uppercase to ensure the values are not lowercased when parsed
+        let access_key_id = "FAKE_access_key_id";
+        let secret_access_key = "FAKE_secret_access_key";
+        let region = "fake_us-east-2";
+        let endpoint = "endpoint33";
+        let session_token = "FAKE_session_token";
+        let location = "s3://bucket/path/FAKE/file.parquet";
+
+        let table_url = ListingTableUrl::parse(location)?;
+        let scheme = table_url.scheme();
+        let sql = format!(
+            "CREATE EXTERNAL TABLE test STORED AS PARQUET OPTIONS\
+            ('aws.access_key_id' '{access_key_id}', \
+            'aws.secret_access_key' '{secret_access_key}', \
+            'aws.region' '{region}', \
+            'aws.session_token' {session_token}, \
+            'aws.endpoint' '{endpoint}'\
+            ) LOCATION '{location}'"
+        );
+
+        let ctx = SessionContext::new();
+        ctx.register_table_options_extension_from_scheme(scheme);
+        let table_options = get_table_options(&ctx, &sql).await;
+        let aws_options = table_options.extensions.get::<AwsOptions>().unwrap();
+        let builder =
+            get_s3_object_store_builder(table_url.as_ref(), aws_options, false).await?;
+        // get the actual configuration information, then assert_eq!
+        let config = [
+            (AmazonS3ConfigKey::AccessKeyId, access_key_id),
+            (AmazonS3ConfigKey::SecretAccessKey, secret_access_key),
+            (AmazonS3ConfigKey::Region, region),
+            (AmazonS3ConfigKey::Endpoint, endpoint),
+            (AmazonS3ConfigKey::Token, session_token),
+        ];
+        for (key, value) in config {
+            assert_eq!(value, builder.get_config_value(&key).unwrap());
+        }
+        // Should not skip signature when credentials are provided
+        assert_eq!(
+            builder.get_config_value(&AmazonS3ConfigKey::SkipSignature),
+            Some("false".into())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn s3_object_store_builder_allow_http_error() -> Result<()> {
         let access_key_id = "fake_access_key_id";
         let secret_access_key = "fake_secret_access_key";
-        let region = "fake_us-east-2";
-        let session_token = "fake_session_token";
+        let endpoint = "http://endpoint33";
         let location = "s3://bucket/path/file.parquet";
 
         let table_url = ListingTableUrl::parse(location)?;
         let scheme = table_url.scheme();
-        let sql = format!("CREATE EXTERNAL TABLE test STORED AS PARQUET OPTIONS('aws.access_key_id' '{access_key_id}', 'aws.secret_access_key' '{secret_access_key}', 'aws.region' '{region}', 'aws.session_token' {session_token}) LOCATION '{location}'");
+        let sql = format!(
+            "CREATE EXTERNAL TABLE test STORED AS PARQUET OPTIONS\
+            ('aws.access_key_id' '{access_key_id}', \
+            'aws.secret_access_key' '{secret_access_key}', \
+            'aws.endpoint' '{endpoint}'\
+            ) LOCATION '{location}'"
+        );
 
         let ctx = SessionContext::new();
-        let mut plan = ctx.state().create_logical_plan(&sql).await?;
+        ctx.register_table_options_extension_from_scheme(scheme);
 
-        if let LogicalPlan::Ddl(DdlStatement::CreateExternalTable(cmd)) = &mut plan {
-            register_options(&ctx, scheme);
-            let mut table_options = ctx.state().default_table_options().clone();
-            table_options.alter_with_string_hash_map(&cmd.options)?;
-            let aws_options = table_options.extensions.get::<AwsOptions>().unwrap();
-            let builder =
-                get_s3_object_store_builder(table_url.as_ref(), aws_options).await?;
-            // get the actual configuration information, then assert_eq!
-            let config = [
-                (AmazonS3ConfigKey::AccessKeyId, access_key_id),
-                (AmazonS3ConfigKey::SecretAccessKey, secret_access_key),
-                (AmazonS3ConfigKey::Region, region),
-                (AmazonS3ConfigKey::Token, session_token),
-            ];
-            for (key, value) in config {
-                assert_eq!(value, builder.get_config_value(&key).unwrap());
-            }
-        } else {
-            return plan_err!("LogicalPlan is not a CreateExternalTable");
+        let table_options = get_table_options(&ctx, &sql).await;
+        let aws_options = table_options.extensions.get::<AwsOptions>().unwrap();
+        let err = get_s3_object_store_builder(table_url.as_ref(), aws_options, false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string().lines().next().unwrap_or_default(),
+            "Invalid or Unsupported Configuration: Invalid endpoint: http://endpoint33. HTTP is not allowed for S3 endpoints. To allow HTTP, set 'aws.allow_http' to true"
+        );
+
+        // Now add `allow_http` to the options and check if it works
+        let sql = format!(
+            "CREATE EXTERNAL TABLE test STORED AS PARQUET OPTIONS\
+            ('aws.access_key_id' '{access_key_id}', \
+            'aws.secret_access_key' '{secret_access_key}', \
+            'aws.endpoint' '{endpoint}',\
+            'aws.allow_http' 'true'\
+            ) LOCATION '{location}'"
+        );
+        let table_options = get_table_options(&ctx, &sql).await;
+
+        let aws_options = table_options.extensions.get::<AwsOptions>().unwrap();
+        // ensure this isn't an error
+        get_s3_object_store_builder(table_url.as_ref(), aws_options, false).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn s3_object_store_builder_resolves_region_when_none_provided() -> Result<()> {
+        if let Err(DataFusionError::Execution(e)) = check_aws_envs().await {
+            // Skip test if AWS envs are not set
+            eprintln!("{e}");
+            return Ok(());
         }
+        let expected_region = "eu-central-1";
+        let location = "s3://test-bucket/path/file.parquet";
+        // Set it to a non-existent file to avoid reading the default configuration file
+        unsafe {
+            std::env::set_var("AWS_CONFIG_FILE", "data/aws.config");
+        }
+
+        let table_url = ListingTableUrl::parse(location)?;
+        let aws_options = AwsOptions {
+            region: None, // No region specified - should auto-detect
+            ..Default::default()
+        };
+
+        let builder =
+            get_s3_object_store_builder(table_url.as_ref(), &aws_options, false).await?;
+
+        // Verify that the region was auto-detected in test environment
+        assert_eq!(
+            builder.get_config_value(&AmazonS3ConfigKey::Region),
+            Some(expected_region.to_string())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn s3_object_store_builder_overrides_region_when_resolve_region_enabled()
+    -> Result<()> {
+        if let Err(DataFusionError::Execution(e)) = check_aws_envs().await {
+            // Skip test if AWS envs are not set
+            eprintln!("{e}");
+            return Ok(());
+        }
+
+        let original_region = "us-east-1";
+        let expected_region = "eu-central-1"; // This should be the auto-detected region
+        let location = "s3://test-bucket/path/file.parquet";
+
+        let table_url = ListingTableUrl::parse(location)?;
+        let aws_options = AwsOptions {
+            region: Some(original_region.to_string()), // Explicit region provided
+            ..Default::default()
+        };
+
+        let builder =
+            get_s3_object_store_builder(table_url.as_ref(), &aws_options, true).await?;
+
+        // Verify that the region was overridden by auto-detection
+        assert_eq!(
+            builder.get_config_value(&AmazonS3ConfigKey::Region),
+            Some(expected_region.to_string())
+        );
 
         Ok(())
     }
@@ -522,28 +814,24 @@ mod tests {
 
         let table_url = ListingTableUrl::parse(location)?;
         let scheme = table_url.scheme();
-        let sql = format!("CREATE EXTERNAL TABLE test STORED AS PARQUET OPTIONS('aws.access_key_id' '{access_key_id}', 'aws.secret_access_key' '{secret_access_key}', 'aws.oss.endpoint' '{endpoint}') LOCATION '{location}'");
+        let sql = format!(
+            "CREATE EXTERNAL TABLE test STORED AS PARQUET OPTIONS('aws.access_key_id' '{access_key_id}', 'aws.secret_access_key' '{secret_access_key}', 'aws.oss.endpoint' '{endpoint}') LOCATION '{location}'"
+        );
 
         let ctx = SessionContext::new();
-        let mut plan = ctx.state().create_logical_plan(&sql).await?;
+        ctx.register_table_options_extension_from_scheme(scheme);
+        let table_options = get_table_options(&ctx, &sql).await;
 
-        if let LogicalPlan::Ddl(DdlStatement::CreateExternalTable(cmd)) = &mut plan {
-            register_options(&ctx, scheme);
-            let mut table_options = ctx.state().default_table_options().clone();
-            table_options.alter_with_string_hash_map(&cmd.options)?;
-            let aws_options = table_options.extensions.get::<AwsOptions>().unwrap();
-            let builder = get_oss_object_store_builder(table_url.as_ref(), aws_options)?;
-            // get the actual configuration information, then assert_eq!
-            let config = [
-                (AmazonS3ConfigKey::AccessKeyId, access_key_id),
-                (AmazonS3ConfigKey::SecretAccessKey, secret_access_key),
-                (AmazonS3ConfigKey::Endpoint, endpoint),
-            ];
-            for (key, value) in config {
-                assert_eq!(value, builder.get_config_value(&key).unwrap());
-            }
-        } else {
-            return plan_err!("LogicalPlan is not a CreateExternalTable");
+        let aws_options = table_options.extensions.get::<AwsOptions>().unwrap();
+        let builder = get_oss_object_store_builder(table_url.as_ref(), aws_options)?;
+        // get the actual configuration information, then assert_eq!
+        let config = [
+            (AmazonS3ConfigKey::AccessKeyId, access_key_id),
+            (AmazonS3ConfigKey::SecretAccessKey, secret_access_key),
+            (AmazonS3ConfigKey::Endpoint, endpoint),
+        ];
+        for (key, value) in config {
+            assert_eq!(value, builder.get_config_value(&key).unwrap());
         }
 
         Ok(())
@@ -552,40 +840,66 @@ mod tests {
     #[tokio::test]
     async fn gcs_object_store_builder() -> Result<()> {
         let service_account_path = "fake_service_account_path";
-        let service_account_key =
-            "{\"private_key\": \"fake_private_key.pem\",\"client_email\":\"fake_client_email\"}";
+        let service_account_key = "{\"private_key\": \"fake_private_key.pem\",\"client_email\":\"fake_client_email\"}";
         let application_credentials_path = "fake_application_credentials_path";
         let location = "gcs://bucket/path/file.parquet";
 
         let table_url = ListingTableUrl::parse(location)?;
         let scheme = table_url.scheme();
-        let sql = format!("CREATE EXTERNAL TABLE test STORED AS PARQUET OPTIONS('gcp.service_account_path' '{service_account_path}', 'gcp.service_account_key' '{service_account_key}', 'gcp.application_credentials_path' '{application_credentials_path}') LOCATION '{location}'");
+        let sql = format!(
+            "CREATE EXTERNAL TABLE test STORED AS PARQUET OPTIONS('gcp.service_account_path' '{service_account_path}', 'gcp.service_account_key' '{service_account_key}', 'gcp.application_credentials_path' '{application_credentials_path}') LOCATION '{location}'"
+        );
 
         let ctx = SessionContext::new();
-        let mut plan = ctx.state().create_logical_plan(&sql).await?;
+        ctx.register_table_options_extension_from_scheme(scheme);
+        let table_options = get_table_options(&ctx, &sql).await;
 
-        if let LogicalPlan::Ddl(DdlStatement::CreateExternalTable(cmd)) = &mut plan {
-            register_options(&ctx, scheme);
-            let mut table_options = ctx.state().default_table_options().clone();
-            table_options.alter_with_string_hash_map(&cmd.options)?;
-            let gcp_options = table_options.extensions.get::<GcpOptions>().unwrap();
-            let builder = get_gcs_object_store_builder(table_url.as_ref(), gcp_options)?;
-            // get the actual configuration information, then assert_eq!
-            let config = [
-                (GoogleConfigKey::ServiceAccount, service_account_path),
-                (GoogleConfigKey::ServiceAccountKey, service_account_key),
-                (
-                    GoogleConfigKey::ApplicationCredentials,
-                    application_credentials_path,
-                ),
-            ];
-            for (key, value) in config {
-                assert_eq!(value, builder.get_config_value(&key).unwrap());
-            }
-        } else {
-            return plan_err!("LogicalPlan is not a CreateExternalTable");
+        let gcp_options = table_options.extensions.get::<GcpOptions>().unwrap();
+        let builder = get_gcs_object_store_builder(table_url.as_ref(), gcp_options)?;
+        // get the actual configuration information, then assert_eq!
+        let config = [
+            (GoogleConfigKey::ServiceAccount, service_account_path),
+            (GoogleConfigKey::ServiceAccountKey, service_account_key),
+            (
+                GoogleConfigKey::ApplicationCredentials,
+                application_credentials_path,
+            ),
+        ];
+        for (key, value) in config {
+            assert_eq!(value, builder.get_config_value(&key).unwrap());
         }
 
+        Ok(())
+    }
+
+    /// Plans the `CREATE EXTERNAL TABLE` SQL statement and returns the
+    /// resulting resolved `CreateExternalTable` command.
+    async fn get_table_options(ctx: &SessionContext, sql: &str) -> TableOptions {
+        let mut plan = ctx.state().create_logical_plan(sql).await.unwrap();
+
+        let LogicalPlan::Ddl(DdlStatement::CreateExternalTable(cmd)) = &mut plan else {
+            panic!("plan is not a CreateExternalTable");
+        };
+
+        let mut table_options = ctx.state().default_table_options();
+        table_options
+            .alter_with_string_hash_map(&cmd.options)
+            .unwrap();
+        table_options
+    }
+
+    async fn check_aws_envs() -> Result<()> {
+        let aws_envs = [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_REGION",
+            "AWS_ALLOW_HTTP",
+        ];
+        for aws_env in aws_envs {
+            std::env::var(aws_env).map_err(|_| {
+                exec_datafusion_err!("aws envs not set, skipping s3 tests")
+            })?;
+        }
         Ok(())
     }
 }

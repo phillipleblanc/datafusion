@@ -15,28 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use crate::parquet::Unit::Page;
 use crate::parquet::{ContextWithParquet, Scenario};
 
-use datafusion::datasource::file_format::parquet::ParquetFormat;
+use arrow::array::RecordBatch;
 use datafusion::datasource::file_format::FileFormat;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
-use datafusion::datasource::physical_plan::{FileScanConfig, ParquetExec};
+use datafusion::datasource::physical_plan::ParquetSource;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::context::SessionState;
-use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::prelude::SessionContext;
-use datafusion_common::{ScalarValue, Statistics, ToDFSchema};
+use datafusion_common::{ScalarValue, ToDFSchema};
 use datafusion_expr::execution_props::ExecutionProps;
-use datafusion_expr::{col, lit, Expr};
+use datafusion_expr::{Expr, col, lit};
 use datafusion_physical_expr::create_physical_expr;
 
+use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use futures::StreamExt;
-use object_store::path::Path;
 use object_store::ObjectMeta;
+use object_store::path::Path;
 
-async fn get_parquet_exec(state: &SessionState, filter: Expr) -> ParquetExec {
+async fn get_parquet_exec(
+    state: &SessionState,
+    filter: Expr,
+    pushdown_filters: bool,
+) -> DataSourceExec {
     let object_store_url = ObjectStoreUrl::local_filesystem();
     let store = state.runtime_env().object_store(&object_store_url).unwrap();
 
@@ -48,13 +57,13 @@ async fn get_parquet_exec(state: &SessionState, filter: Expr) -> ParquetExec {
     let meta = ObjectMeta {
         location,
         last_modified: metadata.modified().map(chrono::DateTime::from).unwrap(),
-        size: metadata.len() as usize,
+        size: metadata.len(),
         e_tag: None,
         version: None,
     };
 
     let schema = ParquetFormat::default()
-        .infer_schema(state, &store, &[meta.clone()])
+        .infer_schema(state, &store, std::slice::from_ref(&meta))
         .await
         .unwrap();
 
@@ -62,64 +71,66 @@ async fn get_parquet_exec(state: &SessionState, filter: Expr) -> ParquetExec {
         object_meta: meta,
         partition_values: vec![],
         range: None,
+        statistics: None,
         extensions: None,
+        metadata_size_hint: None,
     };
 
     let df_schema = schema.clone().to_dfschema().unwrap();
     let execution_props = ExecutionProps::new();
     let predicate = create_physical_expr(&filter, &df_schema, &execution_props).unwrap();
 
-    let parquet_exec = ParquetExec::new(
-        FileScanConfig {
-            object_store_url,
-            file_groups: vec![vec![partitioned_file]],
-            file_schema: schema.clone(),
-            statistics: Statistics::new_unknown(&schema),
-            // file has 10 cols so index 12 should be month
-            projection: None,
-            limit: None,
-            table_partition_cols: vec![],
-            output_ordering: vec![],
-        },
-        Some(predicate),
-        None,
-        Default::default(),
+    let source = Arc::new(
+        ParquetSource::new(schema.clone())
+            .with_predicate(predicate)
+            .with_enable_page_index(true)
+            .with_pushdown_filters(pushdown_filters),
     );
-    parquet_exec.with_enable_page_index(true)
+    let base_config = FileScanConfigBuilder::new(object_store_url, source)
+        .with_file(partitioned_file)
+        .build();
+
+    DataSourceExec::new(Arc::new(base_config))
+}
+
+async fn get_filter_results(
+    state: &SessionState,
+    filter: Expr,
+    pushdown_filters: bool,
+) -> Vec<RecordBatch> {
+    let parquet_exec = get_parquet_exec(state, filter, pushdown_filters).await;
+    let task_ctx = state.task_ctx();
+    let mut results = parquet_exec.execute(0, task_ctx.clone()).unwrap();
+    let mut batches = Vec::new();
+    while let Some(Ok(batch)) = results.next().await {
+        batches.push(batch);
+    }
+    batches
 }
 
 #[tokio::test]
 async fn page_index_filter_one_col() {
     let session_ctx = SessionContext::new();
     let state = session_ctx.state();
-    let task_ctx = state.task_ctx();
 
     // 1.create filter month == 1;
     let filter = col("month").eq(lit(1_i32));
 
-    let parquet_exec = get_parquet_exec(&state, filter).await;
-
-    let mut results = parquet_exec.execute(0, task_ctx.clone()).unwrap();
-
-    let batch = results.next().await.unwrap().unwrap();
-
+    let batches = get_filter_results(&state, filter.clone(), false).await;
     // `month = 1` from the page index should create below RowSelection
     //  vec.push(RowSelector::select(312));
     //  vec.push(RowSelector::skip(3330));
     //  vec.push(RowSelector::select(339));
     //  vec.push(RowSelector::skip(3319));
     // total 651 row
-    assert_eq!(batch.num_rows(), 651);
+    assert_eq!(batches[0].num_rows(), 651);
+
+    let batches = get_filter_results(&state, filter, true).await;
+    assert_eq!(batches[0].num_rows(), 620);
 
     // 2. create filter month == 1 or month == 2;
     let filter = col("month").eq(lit(1_i32)).or(col("month").eq(lit(2_i32)));
-
-    let parquet_exec = get_parquet_exec(&state, filter).await;
-
-    let mut results = parquet_exec.execute(0, task_ctx.clone()).unwrap();
-
-    let batch = results.next().await.unwrap().unwrap();
-
+    let batches = get_filter_results(&state, filter.clone(), false).await;
     // `month = 1` or `month = 2` from the page index should create below RowSelection
     //  vec.push(RowSelector::select(312));
     //  vec.push(RowSelector::skip(900));
@@ -129,94 +140,78 @@ async fn page_index_filter_one_col() {
     //  vec.push(RowSelector::skip(873));
     //  vec.push(RowSelector::select(318));
     //  vec.push(RowSelector::skip(2128));
-    assert_eq!(batch.num_rows(), 1281);
+    assert_eq!(batches[0].num_rows(), 1281);
+
+    let batches = get_filter_results(&state, filter, true).await;
+    assert_eq!(batches[0].num_rows(), 1180);
 
     // 3. create filter month == 1 and month == 12;
     let filter = col("month")
         .eq(lit(1_i32))
         .and(col("month").eq(lit(12_i32)));
+    let batches = get_filter_results(&state, filter.clone(), false).await;
+    assert!(batches.is_empty());
 
-    let parquet_exec = get_parquet_exec(&state, filter).await;
-
-    let mut results = parquet_exec.execute(0, task_ctx.clone()).unwrap();
-
-    let batch = results.next().await;
-
-    assert!(batch.is_none());
+    let batches = get_filter_results(&state, filter, true).await;
+    assert!(batches.is_empty());
 
     // 4.create filter 0 < month < 2 ;
     let filter = col("month").gt(lit(0_i32)).and(col("month").lt(lit(2_i32)));
-
-    let parquet_exec = get_parquet_exec(&state, filter).await;
-
-    let mut results = parquet_exec.execute(0, task_ctx.clone()).unwrap();
-
-    let batch = results.next().await.unwrap().unwrap();
-
+    let batches = get_filter_results(&state, filter.clone(), false).await;
     // should same with `month = 1`
-    assert_eq!(batch.num_rows(), 651);
+    assert_eq!(batches[0].num_rows(), 651);
+    let batches = get_filter_results(&state, filter, true).await;
+    assert_eq!(batches[0].num_rows(), 620);
 
-    let session_ctx = SessionContext::new();
-    let task_ctx = session_ctx.task_ctx();
-
-    // 5.create filter date_string_col == 1;
-    let filter = col("date_string_col").eq(lit("01/01/09"));
-    let parquet_exec = get_parquet_exec(&state, filter).await;
-    let mut results = parquet_exec.execute(0, task_ctx.clone()).unwrap();
-    let batch = results.next().await.unwrap().unwrap();
+    // 5.create filter date_string_col == "01/01/09"`;
+    // Note this test doesn't apply type coercion so the literal must match the actual view type
+    let filter = col("date_string_col").eq(lit(ScalarValue::new_utf8view("01/01/09")));
+    let batches = get_filter_results(&state, filter.clone(), false).await;
+    assert_eq!(batches[0].num_rows(), 14);
 
     // there should only two pages match the filter
     //                                  min                                        max
     // page-20                        0  01/01/09                                  01/02/09
     // page-21                        0  01/01/09                                  01/01/09
     // each 7 rows
-    assert_eq!(batch.num_rows(), 14);
+    assert_eq!(batches[0].num_rows(), 14);
+    let batches = get_filter_results(&state, filter, true).await;
+    assert_eq!(batches[0].num_rows(), 10);
 }
 
 #[tokio::test]
 async fn page_index_filter_multi_col() {
     let session_ctx = SessionContext::new();
     let state = session_ctx.state();
-    let task_ctx = session_ctx.task_ctx();
 
     // create filter month == 1 and year = 2009;
     let filter = col("month").eq(lit(1_i32)).and(col("year").eq(lit(2009)));
-
-    let parquet_exec = get_parquet_exec(&state, filter).await;
-
-    let mut results = parquet_exec.execute(0, task_ctx.clone()).unwrap();
-
-    let batch = results.next().await.unwrap().unwrap();
-
+    let batches = get_filter_results(&state, filter.clone(), false).await;
     //  `year = 2009` from the page index should create below RowSelection
     //  vec.push(RowSelector::select(3663));
     //  vec.push(RowSelector::skip(3642));
     //  combine with `month = 1` total 333 row
-    assert_eq!(batch.num_rows(), 333);
+    assert_eq!(batches[0].num_rows(), 333);
+    let batches = get_filter_results(&state, filter, true).await;
+    assert_eq!(batches[0].num_rows(), 310);
 
     // create filter (year = 2009 or id = 1) and month = 1;
     // this should only use `month = 1` to evaluate the page index.
     let filter = col("month")
         .eq(lit(1_i32))
         .and(col("year").eq(lit(2009)).or(col("id").eq(lit(1))));
-
-    let parquet_exec = get_parquet_exec(&state, filter).await;
-
-    let mut results = parquet_exec.execute(0, task_ctx.clone()).unwrap();
-
-    let batch = results.next().await.unwrap().unwrap();
-    assert_eq!(batch.num_rows(), 651);
+    let batches = get_filter_results(&state, filter.clone(), false).await;
+    assert_eq!(batches[0].num_rows(), 651);
+    let batches = get_filter_results(&state, filter, true).await;
+    assert_eq!(batches[0].num_rows(), 310);
 
     // create filter (year = 2009 or id = 1)
     // this filter use two columns will not push down
     let filter = col("year").eq(lit(2009)).or(col("id").eq(lit(1)));
-
-    let parquet_exec = get_parquet_exec(&state, filter).await;
-
-    let mut results = parquet_exec.execute(0, task_ctx.clone()).unwrap();
-
-    let batch = results.next().await.unwrap().unwrap();
-    assert_eq!(batch.num_rows(), 7300);
+    let batches = get_filter_results(&state, filter.clone(), false).await;
+    assert_eq!(batches[0].num_rows(), 7300);
+    let batches = get_filter_results(&state, filter, true).await;
+    assert_eq!(batches[0].num_rows(), 3650);
 
     // create filter (year = 2009 and id = 1) or (year = 2010)
     // this filter use two columns will not push down
@@ -226,13 +221,10 @@ async fn page_index_filter_multi_col() {
         .eq(lit(2009))
         .and(col("id").eq(lit(1)))
         .or(col("year").eq(lit(2010)));
-
-    let parquet_exec = get_parquet_exec(&state, filter).await;
-
-    let mut results = parquet_exec.execute(0, task_ctx.clone()).unwrap();
-
-    let batch = results.next().await.unwrap().unwrap();
-    assert_eq!(batch.num_rows(), 7300);
+    let batches = get_filter_results(&state, filter.clone(), false).await;
+    assert_eq!(batches[0].num_rows(), 7300);
+    let batches = get_filter_results(&state, filter, true).await;
+    assert_eq!(batches[0].num_rows(), 3651);
 }
 
 async fn test_prune(
@@ -241,9 +233,10 @@ async fn test_prune(
     expected_errors: Option<usize>,
     expected_row_pages_pruned: Option<usize>,
     expected_results: usize,
+    row_per_page: usize,
 ) {
     let output: crate::parquet::TestOutput =
-        ContextWithParquet::new(case_data_type, Page)
+        ContextWithParquet::new(case_data_type, Page(row_per_page))
             .await
             .query(sql)
             .await;
@@ -272,6 +265,7 @@ async fn prune_timestamps_nanos() {
         Some(0),
         Some(5),
         10,
+        5,
     )
     .await;
 }
@@ -289,6 +283,7 @@ async fn prune_timestamps_micros() {
         Some(0),
         Some(5),
         10,
+        5,
     )
     .await;
 }
@@ -306,6 +301,7 @@ async fn prune_timestamps_millis() {
         Some(0),
         Some(5),
         10,
+        5,
     )
     .await;
 }
@@ -324,6 +320,7 @@ async fn prune_timestamps_seconds() {
         Some(0),
         Some(5),
         10,
+        5,
     )
     .await;
 }
@@ -341,6 +338,7 @@ async fn prune_date32() {
         Some(0),
         Some(15),
         1,
+        5,
     )
     .await;
 }
@@ -359,7 +357,7 @@ async fn prune_date64() {
         .and_time(chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap());
     let date = ScalarValue::Date64(Some(date.and_utc().timestamp_millis()));
 
-    let output = ContextWithParquet::new(Scenario::Dates, Page)
+    let output = ContextWithParquet::new(Scenario::Dates, Page(5))
         .await
         .query_with_expr(col("date64").lt(lit(date)))
         .await;
@@ -387,6 +385,7 @@ macro_rules! int_tests {
                     Some(0),
                     Some(5),
                     11,
+                    5,
                 )
                 .await;
                 // result of sql "SELECT * FROM t where i < 1" is same as
@@ -397,6 +396,7 @@ macro_rules! int_tests {
                     Some(0),
                     Some(5),
                     11,
+                    5,
                 )
                 .await;
             }
@@ -409,6 +409,7 @@ macro_rules! int_tests {
                     Some(0),
                     Some(15),
                     1,
+                    5,
                 )
                 .await;
 
@@ -418,6 +419,7 @@ macro_rules! int_tests {
                     Some(0),
                     Some(15),
                     1,
+                    5,
                 )
                 .await;
             }
@@ -430,6 +432,7 @@ macro_rules! int_tests {
                     Some(0),
                     Some(15),
                     1,
+                    5
                 )
                 .await;
             }
@@ -441,6 +444,7 @@ macro_rules! int_tests {
                     Some(0),
                     Some(15),
                     1,
+                    5
                 )
                 .await;
             }
@@ -453,6 +457,7 @@ macro_rules! int_tests {
                     Some(0),
                     Some(0),
                     3,
+                    5
                 )
                 .await;
             }
@@ -465,6 +470,7 @@ macro_rules! int_tests {
                     Some(0),
                     Some(0),
                     2,
+                    5
                 )
                 .await;
             }
@@ -477,6 +483,7 @@ macro_rules! int_tests {
                     Some(0),
                     Some(0),
                     9,
+                    5
                 )
                 .await;
             }
@@ -490,6 +497,7 @@ macro_rules! int_tests {
                     Some(0),
                     Some(15),
                     1,
+                    5
                 )
                 .await;
             }
@@ -503,6 +511,7 @@ macro_rules! int_tests {
                     Some(0),
                     Some(0),
                     19,
+                    5
                 )
                 .await;
             }
@@ -531,6 +540,7 @@ macro_rules! uint_tests {
                     Some(0),
                     Some(5),
                     11,
+                    5
                 )
                 .await;
             }
@@ -543,6 +553,7 @@ macro_rules! uint_tests {
                     Some(0),
                     Some(15),
                     1,
+                    5
                 )
                 .await;
             }
@@ -555,6 +566,7 @@ macro_rules! uint_tests {
                     Some(0),
                     Some(15),
                     1,
+                    5
                 )
                 .await;
             }
@@ -567,6 +579,7 @@ macro_rules! uint_tests {
                     Some(0),
                     Some(15),
                     1,
+                    5
                 )
                 .await;
             }
@@ -579,6 +592,7 @@ macro_rules! uint_tests {
                     Some(0),
                     Some(0),
                     2,
+                    5
                 )
                 .await;
             }
@@ -591,6 +605,7 @@ macro_rules! uint_tests {
                     Some(0),
                     Some(0),
                     2,
+                    5
                 )
                 .await;
             }
@@ -604,6 +619,7 @@ macro_rules! uint_tests {
                     Some(0),
                     Some(15),
                     1,
+                    5
                 )
                 .await;
             }
@@ -617,6 +633,7 @@ macro_rules! uint_tests {
                     Some(0),
                     Some(0),
                     19,
+                    5
                 )
                 .await;
             }
@@ -642,6 +659,7 @@ async fn prune_f64_lt() {
         Some(0),
         Some(5),
         11,
+        5,
     )
     .await;
     test_prune(
@@ -650,6 +668,7 @@ async fn prune_f64_lt() {
         Some(0),
         Some(5),
         11,
+        5,
     )
     .await;
 }
@@ -664,6 +683,7 @@ async fn prune_f64_scalar_fun_and_gt() {
         Some(0),
         Some(10),
         1,
+        5,
     )
     .await;
 }
@@ -677,6 +697,7 @@ async fn prune_f64_scalar_fun() {
         Some(0),
         Some(0),
         1,
+        5,
     )
     .await;
 }
@@ -690,6 +711,7 @@ async fn prune_f64_complex_expr() {
         Some(0),
         Some(0),
         9,
+        5,
     )
     .await;
 }
@@ -703,6 +725,7 @@ async fn prune_f64_complex_expr_subtract() {
         Some(0),
         Some(0),
         9,
+        5,
     )
     .await;
 }
@@ -718,6 +741,7 @@ async fn prune_decimal_lt() {
         Some(0),
         Some(5),
         6,
+        5,
     )
     .await;
     // compare with the casted decimal value
@@ -727,6 +751,7 @@ async fn prune_decimal_lt() {
         Some(0),
         Some(5),
         8,
+        5,
     )
     .await;
 
@@ -737,6 +762,7 @@ async fn prune_decimal_lt() {
         Some(0),
         Some(5),
         6,
+        5,
     )
     .await;
     // compare with the casted decimal value
@@ -746,6 +772,7 @@ async fn prune_decimal_lt() {
         Some(0),
         Some(5),
         8,
+        5,
     )
     .await;
 }
@@ -761,6 +788,7 @@ async fn prune_decimal_eq() {
         Some(0),
         Some(5),
         2,
+        5,
     )
     .await;
     test_prune(
@@ -769,6 +797,7 @@ async fn prune_decimal_eq() {
         Some(0),
         Some(5),
         2,
+        5,
     )
     .await;
 
@@ -779,6 +808,7 @@ async fn prune_decimal_eq() {
         Some(0),
         Some(5),
         2,
+        5,
     )
     .await;
     test_prune(
@@ -787,6 +817,7 @@ async fn prune_decimal_eq() {
         Some(0),
         Some(5),
         2,
+        5,
     )
     .await;
     test_prune(
@@ -795,6 +826,7 @@ async fn prune_decimal_eq() {
         Some(0),
         Some(10),
         2,
+        5,
     )
     .await;
 }
@@ -810,6 +842,7 @@ async fn prune_decimal_in_list() {
         Some(0),
         Some(5),
         5,
+        5,
     )
     .await;
     test_prune(
@@ -818,6 +851,7 @@ async fn prune_decimal_in_list() {
         Some(0),
         Some(5),
         6,
+        5,
     )
     .await;
 
@@ -828,6 +862,7 @@ async fn prune_decimal_in_list() {
         Some(0),
         Some(5),
         5,
+        5,
     )
     .await;
     test_prune(
@@ -836,17 +871,18 @@ async fn prune_decimal_in_list() {
         Some(0),
         Some(5),
         6,
+        5,
     )
     .await;
 }
 
 #[tokio::test]
 async fn without_pushdown_filter() {
-    let mut context = ContextWithParquet::new(Scenario::Timestamps, Page).await;
+    let mut context = ContextWithParquet::new(Scenario::Timestamps, Page(5)).await;
 
     let output1 = context.query("SELECT * FROM t").await;
 
-    let mut context = ContextWithParquet::new(Scenario::Timestamps, Page).await;
+    let mut context = ContextWithParquet::new(Scenario::Timestamps, Page(5)).await;
 
     let output2 = context
         .query("SELECT * FROM t where nanos < to_timestamp('2023-01-02 01:01:11Z')")
@@ -867,8 +903,63 @@ async fn without_pushdown_filter() {
     )
     .unwrap();
 
-    // Without filter will not read pageIndex.
-    assert!(bytes_scanned_with_filter > bytes_scanned_without_filter);
+    // Same amount of bytes are scanned when defaulting to cache parquet metadata
+    assert_eq!(bytes_scanned_with_filter, bytes_scanned_without_filter);
+}
+
+#[tokio::test]
+// Data layout like this:
+// row_group1: page1(1~5), page2(All Null)
+// row_group2: page1(1~5), page2(6~10)
+// row_group3: page1(1~5), page2(6~9 + Null)
+// row_group4: page1(1~5), page2(All Null)
+// total 40 rows
+async fn test_pages_with_null_values() {
+    test_prune(
+        Scenario::WithNullValuesPageLevel,
+        "SELECT * FROM t where i8 <= 6",
+        Some(0),
+        // expect prune pages with all null or pages that have only values greater than 6
+        // (row_group1, page2), (row_group4, page2)
+        Some(10),
+        22,
+        5,
+    )
+    .await;
+
+    test_prune(
+        Scenario::WithNullValuesPageLevel,
+        "SELECT * FROM t where \"i16\" is not null",
+        Some(0),
+        // expect prune (row_group1, page2) and (row_group4, page2) = 10 rows
+        Some(10),
+        29,
+        5,
+    )
+    .await;
+
+    test_prune(
+        Scenario::WithNullValuesPageLevel,
+        "SELECT * FROM t where \"i32\" is null",
+        Some(0),
+        // expect prune (row_group1, page1), (row_group2, page1+2), (row_group3, page1), (row_group3, page1) =  25 rows
+        Some(25),
+        11,
+        5,
+    )
+    .await;
+
+    test_prune(
+        Scenario::WithNullValuesPageLevel,
+        "SELECT * FROM t where \"i64\" > 6",
+        Some(0),
+        // expect to prune pages where i is all null, or where always <= 5
+        // (row_group1, page1+2), (row_group2, page1), (row_group3, page1) (row_group4, page1+2) = 30 rows
+        Some(30),
+        7,
+        5,
+    )
+    .await;
 }
 
 fn cast_count_metric(metric: MetricValue) -> Option<usize> {

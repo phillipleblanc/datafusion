@@ -18,10 +18,26 @@
 //! Function module contains typing and signature for built-in and user defined functions.
 
 use crate::ColumnarValue;
-use crate::{Accumulator, Expr, PartitionEvaluator};
-use arrow::datatypes::{DataType, Schema};
+use crate::{Expr, PartitionEvaluator};
+use arrow::datatypes::DataType;
 use datafusion_common::Result;
 use std::sync::Arc;
+
+pub use datafusion_functions_aggregate_common::accumulator::{
+    AccumulatorArgs, AccumulatorFactoryFunction, StateFieldsArgs,
+};
+
+pub use datafusion_functions_window_common::expr::ExpressionArgs;
+pub use datafusion_functions_window_common::field::WindowUDFFieldArgs;
+pub use datafusion_functions_window_common::partition::PartitionEvaluatorArgs;
+
+#[derive(Debug, Clone, Copy)]
+pub enum Hint {
+    /// Indicates the argument needs to be padded if it is scalar
+    Pad,
+    /// Indicates the argument can be converted to an array of length 1
+    AcceptsSingular,
+}
 
 /// Scalar function
 ///
@@ -38,56 +54,6 @@ pub type ScalarFunctionImplementation =
 pub type ReturnTypeFunction =
     Arc<dyn Fn(&[DataType]) -> Result<Arc<DataType>> + Send + Sync>;
 
-/// [`AccumulatorArgs`] contains information about how an aggregate
-/// function was called, including the types of its arguments and any optional
-/// ordering expressions.
-pub struct AccumulatorArgs<'a> {
-    /// The return type of the aggregate function.
-    pub data_type: &'a DataType,
-    /// The schema of the input arguments
-    pub schema: &'a Schema,
-    /// Whether to ignore nulls.
-    ///
-    /// SQL allows the user to specify `IGNORE NULLS`, for example:
-    ///
-    /// ```sql
-    /// SELECT FIRST_VALUE(column1) IGNORE NULLS FROM t;
-    /// ```
-    pub ignore_nulls: bool,
-
-    /// The expressions in the `ORDER BY` clause passed to this aggregator.
-    ///
-    /// SQL allows the user to specify the ordering of arguments to the
-    /// aggregate using an `ORDER BY`. For example:
-    ///
-    /// ```sql
-    /// SELECT FIRST_VALUE(column1 ORDER BY column2) FROM t;
-    /// ```
-    ///
-    /// If no `ORDER BY` is specified, `sort_exprs`` will be empty.
-    pub sort_exprs: &'a [Expr],
-}
-
-impl<'a> AccumulatorArgs<'a> {
-    pub fn new(
-        data_type: &'a DataType,
-        schema: &'a Schema,
-        ignore_nulls: bool,
-        sort_exprs: &'a [Expr],
-    ) -> Self {
-        Self {
-            data_type,
-            schema,
-            ignore_nulls,
-            sort_exprs,
-        }
-    }
-}
-
-/// Factory that returns an accumulator for the given aggregate function.
-pub type AccumulatorFactoryFunction =
-    Arc<dyn Fn(AccumulatorArgs) -> Result<Box<dyn Accumulator>> + Send + Sync>;
-
 /// Factory that creates a PartitionEvaluator for the given window
 /// function
 pub type PartitionEvaluatorFactory =
@@ -97,3 +63,29 @@ pub type PartitionEvaluatorFactory =
 /// its state, given its return datatype.
 pub type StateTypeFunction =
     Arc<dyn Fn(&DataType) -> Result<Arc<Vec<DataType>>> + Send + Sync>;
+
+/// [crate::udaf::AggregateUDFImpl::simplify] simplifier closure
+/// A closure with two arguments:
+/// * 'aggregate_function': [crate::expr::AggregateFunction] for which simplified has been invoked
+/// * 'info': [crate::simplify::SimplifyInfo]
+///
+/// Closure returns simplified [Expr] or an error.
+pub type AggregateFunctionSimplification = Box<
+    dyn Fn(
+        crate::expr::AggregateFunction,
+        &dyn crate::simplify::SimplifyInfo,
+    ) -> Result<Expr>,
+>;
+
+/// [crate::udwf::WindowUDFImpl::simplify] simplifier closure
+/// A closure with two arguments:
+/// * 'window_function': [crate::expr::WindowFunction] for which simplified has been invoked
+/// * 'info': [crate::simplify::SimplifyInfo]
+///
+/// Closure returns simplified [Expr] or an error.
+pub type WindowFunctionSimplification = Box<
+    dyn Fn(
+        crate::expr::WindowFunction,
+        &dyn crate::simplify::SimplifyInfo,
+    ) -> Result<Expr>,
+>;

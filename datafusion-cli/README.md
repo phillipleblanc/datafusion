@@ -19,28 +19,17 @@
 
 <!-- Note this file is included in the crates.io page as well https://crates.io/crates/datafusion-cli -->
 
-# DataFusion Command-line Interface
+# Apache DataFusion Command-line Interface
 
-[DataFusion](https://arrow.apache.org/datafusion/) is an extensible query execution framework, written in Rust, that uses Apache Arrow as its in-memory format.
+[Apache DataFusion] is an extensible query execution framework, written in Rust, that uses [Apache Arrow] as its in-memory format.
 
-The DataFusion CLI is a command line utility that runs SQL queries using the DataFusion engine.
+DataFusion CLI (`datafusion-cli`) is a small command line utility that runs SQL queries using the DataFusion engine.
+
+[apache arrow]: https://arrow.apache.org/
+[apache datafusion]: https://datafusion.apache.org/
 
 # Frequently Asked Questions
 
 ## Where can I find more information?
 
-Answer: See the [`datafusion-cli` documentation](https://arrow.apache.org/datafusion/user-guide/cli.html) for further information.
-
-## How do I make my IDE work with `datafusion-cli`?
-
-Answer: "open" the `datafusion/datafusion-cli` project as its own top level
-project in my IDE (rather than opening `datafusion`)
-
-The reason `datafusion-cli` is not listed as part of the workspace in the main
-[`datafusion Cargo.toml`] file is that `datafusion-cli` is a binary and has a
-checked in `Cargo.lock` file to ensure reproducible builds.
-
-However, the `datafusion` and sub crates are intended for use as libraries and
-thus do not have a `Cargo.lock` file checked in.
-
-[`datafusion cargo.toml`]: https://github.com/apache/arrow-datafusion/blob/main/Cargo.toml
+See the [`datafusion-cli` documentation](https://datafusion.apache.org/user-guide/cli/index.html) for further information.

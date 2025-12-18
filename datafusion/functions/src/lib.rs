@@ -15,6 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/apache/datafusion/19fe44cf2f30cbdd63d4a4f52c74055163c6cc38/docs/logos/standalone_logo/logo_original.svg",
+    html_favicon_url = "https://raw.githubusercontent.com/apache/datafusion/19fe44cf2f30cbdd63d4a4f52c74055163c6cc38/docs/logos/standalone_logo/logo_original.svg"
+)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+// Make sure fast / cheap clones on Arc are explicit:
+// https://github.com/apache/datafusion/issues/11143
+#![deny(clippy::clone_on_ref_ptr)]
+#![cfg_attr(test, allow(clippy::needless_pass_by_value))]
+// https://github.com/apache/datafusion/issues/18881
+#![deny(clippy::allow_attributes)]
+
 //! Function packages for [DataFusion].
 //!
 //! This crate contains a collection of various function packages for DataFusion,
@@ -74,12 +86,14 @@
 //! 3. Add a new feature to `Cargo.toml`, with any optional dependencies
 //!
 //! 4. Use the `make_package!` macro to expose the module when the
-//! feature is enabled.
+//!    feature is enabled.
 //!
 //! [`ScalarUDF`]: datafusion_expr::ScalarUDF
 use datafusion_common::Result;
 use datafusion_execution::FunctionRegistry;
+use datafusion_expr::ScalarUDF;
 use log::debug;
+use std::sync::Arc;
 
 #[macro_use]
 pub mod macros;
@@ -89,10 +103,8 @@ pub mod string;
 make_stub_package!(string, "string_expressions");
 
 /// Core datafusion expressions
-/// Enabled via feature flag `core_expressions`
-#[cfg(feature = "core_expressions")]
+/// These are always available and not controlled by a feature flag
 pub mod core;
-make_stub_package!(core, "core_expressions");
 
 /// Date and time expressions.
 /// Contains functions such as to_timestamp
@@ -128,11 +140,15 @@ make_stub_package!(crypto, "crypto_expressions");
 pub mod unicode;
 make_stub_package!(unicode, "unicode_expressions");
 
-mod utils;
+#[cfg(any(feature = "datetime_expressions", feature = "unicode_expressions"))]
+pub mod planner;
+
+pub mod strings;
+
+pub mod utils;
 
 /// Fluent-style API for creating `Expr`s
 pub mod expr_fn {
-    #[cfg(feature = "core_expressions")]
     pub use super::core::expr_fn::*;
     #[cfg(feature = "crypto_expressions")]
     pub use super::crypto::expr_fn::*;
@@ -150,9 +166,9 @@ pub mod expr_fn {
     pub use super::unicode::expr_fn::*;
 }
 
-/// Registers all enabled packages with a [`FunctionRegistry`]
-pub fn register_all(registry: &mut dyn FunctionRegistry) -> Result<()> {
-    let mut all_functions = core::functions()
+/// Return all default functions
+pub fn all_default_functions() -> Vec<Arc<ScalarUDF>> {
+    core::functions()
         .into_iter()
         .chain(datetime::functions())
         .chain(encoding::functions())
@@ -160,9 +176,15 @@ pub fn register_all(registry: &mut dyn FunctionRegistry) -> Result<()> {
         .chain(regex::functions())
         .chain(crypto::functions())
         .chain(unicode::functions())
-        .chain(string::functions());
+        .chain(string::functions())
+        .collect::<Vec<_>>()
+}
 
-    all_functions.try_for_each(|udf| {
+/// Registers all enabled packages with a [`FunctionRegistry`]
+pub fn register_all(registry: &mut dyn FunctionRegistry) -> Result<()> {
+    let all_functions = all_default_functions();
+
+    all_functions.into_iter().try_for_each(|udf| {
         let existing_udf = registry.register_udf(udf)?;
         if let Some(existing_udf) = existing_udf {
             debug!("Overwrite existing UDF: {}", existing_udf.name());
@@ -170,4 +192,37 @@ pub fn register_all(registry: &mut dyn FunctionRegistry) -> Result<()> {
         Ok(()) as Result<()>
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+#[ctor::ctor]
+fn init() {
+    // Enable RUST_LOG logging configuration for test
+    let _ = env_logger::try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::all_default_functions;
+    use datafusion_common::Result;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_no_duplicate_name() -> Result<()> {
+        let mut names = HashSet::new();
+        for func in all_default_functions() {
+            assert!(
+                names.insert(func.name().to_string().to_lowercase()),
+                "duplicate function name: {}",
+                func.name()
+            );
+            for alias in func.aliases() {
+                assert!(
+                    names.insert(alias.to_string().to_lowercase()),
+                    "duplicate function name: {alias}"
+                );
+            }
+        }
+        Ok(())
+    }
 }

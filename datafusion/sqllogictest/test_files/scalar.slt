@@ -67,13 +67,13 @@ CREATE TABLE small_floats(
 ## abs
 
 # abs scalar function
-query III rowsort
+query III
 select abs(64), abs(0), abs(-64);
 ----
 64 0 64
 
 # abs scalar nulls
-query ? rowsort
+query R
 select abs(null);
 ----
 NULL
@@ -309,6 +309,14 @@ select ceil(a), ceil(b), ceil(c) from small_floats;
 1 0 0
 1 0 1
 
+# ceil with scale parameter(Scale not supported)
+query error DataFusion error: This feature is not implemented: CEIL with scale is not supported
+select ceil(100.1234, 1)
+
+# ceil with datetime parameter (not supported)
+query error DataFusion error: This feature is not implemented: CEIL with datetime is not supported
+select ceil(100.1234 to year)
+
 ## degrees
 
 # degrees scalar function
@@ -448,75 +456,13 @@ select floor(a), floor(b), floor(c) from signed_integers;
 2 -1000 123
 4 NULL NULL
 
-## gcd
+# floor with scale parameter(Scale not supported)
+query error DataFusion error: This feature is not implemented: FLOOR with scale is not supported
+select floor(a, 1)
 
-# gcd scalar function
-query III rowsort
-select gcd(0, 0), gcd(2, 3), gcd(15, 10);
-----
-0 1 5
-
-# gcd scalar nulls
-query I rowsort
-select gcd(null, 64);
-----
-NULL
-
-# gcd scalar nulls #1
-query I rowsort
-select gcd(2, null);
-----
-NULL
-
-# gcd scalar nulls #2
-query I rowsort
-select gcd(null, null);
-----
-NULL
-
-# gcd with columns
-query III rowsort
-select gcd(a, b), gcd(c, d), gcd(e, f) from signed_integers;
-----
-1 1 2
-1 2 6
-2 1 1
-NULL NULL NULL
-
-## lcm
-
-# lcm scalar function
-query III rowsort
-select lcm(0, 0), lcm(2, 3), lcm(15, 10);
-----
-0 6 30
-
-# lcm scalar nulls
-query I rowsort
-select lcm(null, 64);
-----
-NULL
-
-# lcm scalar nulls #1
-query I rowsort
-select lcm(2, null);
-----
-NULL
-
-# lcm scalar nulls #2
-query I rowsort
-select lcm(null, null);
-----
-NULL
-
-# lcm with columns
-query III rowsort
-select lcm(a, b), lcm(c, d), lcm(e, f) from signed_integers;
-----
-100 580608 20
-1000 31488 55
-30000 1001472 12
-NULL NULL NULL
+# floor with datetime parameter ( not supported)
+query error DataFusion error: This feature is not implemented: FLOOR with datetime is not supported
+select floor(a to year)
 
 ## ln
 
@@ -533,7 +479,7 @@ select ln(null);
 NULL
 
 # ln scalar ops with zero edgecases
-# please see https://github.com/apache/arrow-datafusion/pull/5245#issuecomment-1426828382
+# please see https://github.com/apache/datafusion/pull/5245#issuecomment-1426828382
 query R rowsort
 select ln(0);
 ----
@@ -582,7 +528,7 @@ select log(2, 2.0/3) a, log(10, 2.0/3) b;
 -0.584962500721 -0.176091259056
 
 # log scalar ops with zero edgecases
-# please see https://github.com/apache/arrow-datafusion/pull/5245#issuecomment-1426828382
+# please see https://github.com/apache/datafusion/pull/5245#issuecomment-1426828382
 query RR rowsort
 select log(0) a, log(1, 64) b;
 ----
@@ -593,7 +539,7 @@ query RRR rowsort
 select log(a, 64) a, log(b), log(10, b) from unsigned_integers;
 ----
 3 NULL NULL
-3.7855785 4 4
+3.785578521429 4 4
 6 3 3
 Infinity 2 2
 
@@ -605,6 +551,37 @@ select log(a, 64) a, log(b), log(10, b) from signed_integers;
 6 NaN NaN
 NaN 2 2
 NaN 4 4
+
+# log overloaded base 10 float64 and float32 casting scalar
+query RR rowsort
+select log(arrow_cast(10, 'Float64')) a ,log(arrow_cast(100, 'Float32')) b;
+----
+1 2
+
+# log overloaded base 10 float64 and float32 casting with columns
+query RR rowsort
+select log(arrow_cast(a, 'Float64')), log(arrow_cast(b, 'Float32')) from signed_integers;
+----
+0.301029995664 NaN
+0.602059991328 NULL
+NaN 2
+NaN 4
+
+# log float64 and float32 casting scalar
+query RR rowsort
+select log(2,arrow_cast(8, 'Float64')) a, log(2,arrow_cast(16, 'Float32')) b;
+----
+3 4
+
+# log float64 and float32 casting with columns
+query RR rowsort
+select log(2,arrow_cast(a, 'Float64')), log(4,arrow_cast(b, 'Float32')) from signed_integers;
+----
+1 NaN
+2 NULL
+NaN 3.321928
+NaN 6.643856
+
 
 ## log10
 
@@ -627,7 +604,7 @@ select log10(2.0/3);
 -0.176091259056
 
 # log10 scalar ops with zero edgecases
-# please see https://github.com/apache/arrow-datafusion/pull/5245#issuecomment-1426828382
+# please see https://github.com/apache/datafusion/pull/5245#issuecomment-1426828382
 query R rowsort
 select log10(0);
 ----
@@ -663,7 +640,7 @@ select log2(2.0/3);
 -0.584962500721
 
 # log2 scalar ops with zero edgecases
-# please see https://github.com/apache/arrow-datafusion/pull/5245#issuecomment-1426828382
+# please see https://github.com/apache/datafusion/pull/5245#issuecomment-1426828382
 query R rowsort
 select log2(0);
 ----
@@ -769,8 +746,8 @@ select pi(), pi() / 2, pi() / 3;
 
 ## power
 
-# power scalar function
-query III rowsort
+# power scalar function (always returns Float64, like PostgreSQL)
+query RRR rowsort
 select power(2, 0), power(2, 1), power(2, 2);
 ----
 1 2 4
@@ -782,7 +759,7 @@ select power(null, 64);
 NULL
 
 # power scalar nulls #1
-query I rowsort
+query R rowsort
 select power(2, null);
 ----
 NULL
@@ -848,13 +825,23 @@ select round(a), round(b), round(c) from small_floats;
 0 0 1
 1 0 0
 
+# round with too large
+#  max Int32 is 2147483647
+query error DataFusion error: Execution error: Invalid values for decimal places: Cast error: Can't cast value 2147483648 to type Int32
+select round(3.14, 2147483648);
+
+# with array
+query error DataFusion error: Execution error: Invalid values for decimal places: Cast error: Can't cast value 2147483649 to type Int32
+select round(column1, column2) from values (3.14, 2), (3.14, 3), (3.14, 2147483649);
+
+
 ## signum
 
 # signum scalar function
 query RRR rowsort
 select signum(-2), signum(0), signum(2);
 ----
--1 1 1
+-1 0 1
 
 # signum scalar nulls
 query R rowsort
@@ -1263,7 +1250,7 @@ FROM t1
 999
 999
 
-# case_when_else_with_null_contant()
+# case_when_else_with_null_constant()
 query I
  SELECT
 CASE WHEN c1 = 'a' THEN 1
@@ -1276,7 +1263,7 @@ FROM t1
 999
 999
 
-# issue: https://github.com/apache/arrow-datafusion/issues/7004
+# issue: https://github.com/apache/datafusion/issues/7004
 query B
 select case c1
     when 'foo' then TRUE
@@ -1298,34 +1285,34 @@ SELECT CASE WHEN NULL THEN 'foo' ELSE 'bar' END
 bar
 
 # case_expr_with_null()
-query ?
+query I
 select case when b is null then null else b end from (select a,b from (values (1,null),(2,3)) as t (a,b)) a;
 ----
 NULL
 3
 
-query ?
+query I
 select case when b is null then null else b end from (select a,b from (values (1,1),(2,3)) as t (a,b)) a;
 ----
 1
 3
 
 # case_expr_with_nulls()
-query ?
+query I
 select case when b is null then null when b < 3 then null when b >=3 then b + 1 else b end from (select a,b from (values (1,null),(1,2),(2,3)) as t (a,b)) a
 ----
 NULL
 NULL
 4
 
-query ?
+query I
 select case b when 1 then null when 2 then null when 3 then b + 1 else b end from (select a,b from (values (1,null),(1,2),(2,3)) as t (a,b)) a;
 ----
 NULL
 NULL
 4
 
-# issue: https://github.com/apache/arrow-datafusion/issues/6376
+# issue: https://github.com/apache/datafusion/issues/6376
 query I
 select case when a = 0 then 123 end from (values(1), (0), (null)) as t(a);
 ----
@@ -1352,8 +1339,8 @@ CREATE EXTERNAL TABLE aggregate_test_100 (
   c13 VARCHAR NOT NULL
 )
 STORED AS CSV
-WITH HEADER ROW
 LOCATION '../../testing/data/csv/aggregate_test_100.csv'
+OPTIONS ('format.has_header' 'true');
 
 # c8 = i32; c6 = i64
 query TTT
@@ -1586,6 +1573,9 @@ NULL NULL
 query error DataFusion error: Error during planning: Negation only supports numeric, interval and timestamp types
 SELECT -'100'
 
+query error DataFusion error: Error during planning: Unary operator '\+' only supports numeric, interval and timestamp types
+SELECT +true
+
 statement ok
 drop table test_boolean
 
@@ -1638,7 +1628,7 @@ false
 statement ok
 CREATE TABLE t1(
   a boolean,
-  b boolean,
+  b boolean
 ) as VALUES
   (true, true),
   (true, null),
@@ -1715,6 +1705,11 @@ true true false false true true
 statement ok
 drop table t1
 
+# can't use like with non strings
+query error There isn't a common type to coerce Utf8 and Int64 in LIKE expression
+select column1 like 1 from (values('a'), ('b'), (NULL)) as t;
+
+
 # like nlike with null lt
 query BB rowsort
 SELECT column1 like NULL as col_null, NULL like column1 as null_col from (values('a'), ('b'), (NULL)) as t
@@ -1755,7 +1750,7 @@ SELECT make_array(c1, cast(c2 as varchar)) FROM test
 ----
 [, 0]
 [a, 1]
-[aa, ]
+[aa, NULL]
 [aaa, 3]
 
 statement ok
@@ -1766,165 +1761,6 @@ query ?
 SELECT make_array(1, 2, 3);
 ----
 [1, 2, 3]
-
-# coalesce static empty value
-query T
-SELECT COALESCE('', 'test')
-----
-(empty)
-
-# coalesce static value with null
-query T
-SELECT COALESCE(NULL, 'test')
-----
-test
-
-
-statement ok
-create table test1 as values (arrow_cast('foo', 'Dictionary(Int32, Utf8)')), (null);
-
-# test coercion string
-query ?
-select  coalesce(column1, 'none_set') from test1;
-----
-foo
-none_set
-
-# test coercion Int
-query I
-select coalesce(34, arrow_cast(123, 'Dictionary(Int32, Int8)'));
-----
-34
-
-# test with Int
-query I
-select coalesce(arrow_cast(123, 'Dictionary(Int32, Int8)'),34);
-----
-123
-
-# test with null
-query I
-select coalesce(null, 34, arrow_cast(123, 'Dictionary(Int32, Int8)'));
-----
-34
-
-# test with null
-query T
-select  coalesce(null, column1, 'none_set') from test1;
-----
-foo
-none_set
-
-statement ok
-drop table test1
-
-
-statement ok
-CREATE TABLE test(
-  c1 INT,
-  c2 INT
-) as VALUES
-(0, 1),
-(NULL, 1),
-(1, 0),
-(NULL, 1),
-(NULL, NULL);
-
-# coalesce result
-query I rowsort
-SELECT COALESCE(c1, c2) FROM test
-----
-0
-1
-1
-1
-NULL
-
-# coalesce result with default value
-query T rowsort
-SELECT COALESCE(c1, c2, '-1') FROM test
-----
--1
-0
-1
-1
-1
-
-statement ok
-drop table test
-
-statement ok
-CREATE TABLE test(
-  c1 INT,
-  c2 INT
-) as VALUES
-(1, 2),
-(NULL, 2),
-(1, NULL),
-(NULL, NULL);
-
-# coalesce sum with default value
-query I
-SELECT SUM(COALESCE(c1, c2, 0)) FROM test
-----
-4
-
-# coalesce mul with default value
-query I
-SELECT COALESCE(c1 * c2, 0) FROM test
-----
-2
-0
-0
-0
-
-statement ok
-drop table test
-
-# coalesce date32
-
-statement ok
-CREATE TABLE test(
-  d1_date DATE,
-  d2_date DATE,
-  d3_date DATE
-) as VALUES
-  ('2022-12-12','2022-12-12','2022-12-12'),
-  (NULL,'2022-12-11','2022-12-12'),
-  ('2022-12-12','2022-12-10','2022-12-12'),
-  ('2022-12-12',NULL,'2022-12-12'),
-  ('2022-12-12','2022-12-8','2022-12-12'),
-  ('2022-12-12','2022-12-7',NULL),
-  ('2022-12-12',NULL,'2022-12-12'),
-  (NULL,'2022-12-5','2022-12-12')
-;
-
-query D
-SELECT COALESCE(d1_date, d2_date, d3_date) FROM test
-----
-2022-12-12
-2022-12-11
-2022-12-12
-2022-12-12
-2022-12-12
-2022-12-12
-2022-12-12
-2022-12-05
-
-query T
-SELECT arrow_typeof(COALESCE(d1_date, d2_date, d3_date)) FROM test
-----
-Date32
-Date32
-Date32
-Date32
-Date32
-Date32
-Date32
-Date32
-
-statement ok
-drop table test
 
 statement ok
 CREATE TABLE test(
@@ -1939,7 +1775,7 @@ CREATE TABLE test(
 (-14, -14, -14.5, -14.5),
 (NULL, NULL, NULL, NULL);
 
-query RRRRIR rowsort
+query RRRRRR rowsort
 SELECT power(i32, exp_i) as power_i32,
        power(i64, exp_f) as power_i64,
        pow(f32, exp_i) as power_f32,
@@ -1958,53 +1794,34 @@ statement ok
 drop table test
 
 # error message for wrong function signature (Variadic: arbitrary number of args all from some common types)
-statement error Error during planning: No function matches the given name and argument types 'concat\(\)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tconcat\(Utf8, ..\)
+statement error
 SELECT concat();
 
 # error message for wrong function signature (Uniform: t args all from some common types)
-statement error DataFusion error: Error during planning: No function matches the given name and argument types 'nullif\(Int64\)'. You might need to add explicit type casts.
+statement error
 SELECT nullif(1);
 
-
 # error message for wrong function signature (Exact: exact number of args of an exact type)
-statement error Error during planning: No function matches the given name and argument types 'pi\(Float64\)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tpi\(\)
+statement error
 SELECT pi(3.14);
 
 # error message for wrong function signature (Any: fixed number of args of arbitrary types)
-statement error Error during planning: No function matches the given name and argument types 'arrow_typeof\(Int64, Int64\)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tarrow_typeof\(Any\)
+statement error
 SELECT arrow_typeof(1, 1);
 
 # error message for wrong function signature (OneOf: fixed number of args of arbitrary types)
-statement error Error during planning: No function matches the given name and argument types 'power\(Int64, Int64, Int64\)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tpower\(Int64, Int64\)\n\tpower\(Float64, Float64\)
+statement error
 SELECT power(1, 2, 3);
 
 # The following functions need 1 argument
-statement error Error during planning: No function matches the given name and argument types 'abs\(\)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tabs\(Any\)
+statement error
 SELECT abs();
 
-statement error Error during planning: No function matches the given name and argument types 'acos\(\)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tacos\(Float64/Float32\)
+statement error
 SELECT acos();
 
-statement error Error during planning: No function matches the given name and argument types 'isnan\(\)'. You might need to add explicit type casts.\n\tCandidate functions:\n\tisnan\(Float32\)\n\tisnan\(Float64\)
+statement error
 SELECT isnan();
-
-# turn off enable_ident_normalization
-statement ok
-set datafusion.sql_parser.enable_ident_normalization = false;
-
-query I
-SELECT LENGTH('str');
-----
-3
-
-query T
-SELECT CONCAT('Hello', 'World')
-----
-HelloWorld
-
-# turn on enable_ident_normalization
-statement ok
-set datafusion.sql_parser.enable_ident_normalization = true;
 
 query I
 SELECT LENGTH('str');
@@ -2031,11 +1848,11 @@ query TT
 EXPLAIN SELECT letter, letter = LEFT('APACHE', 1) FROM simple_string;
 ----
 logical_plan
-Projection: simple_string.letter, simple_string.letter = Utf8("A") AS simple_string.letter = left(Utf8("APACHE"),Int64(1))
---TableScan: simple_string projection=[letter]
+01)Projection: simple_string.letter, simple_string.letter = Utf8View("A") AS simple_string.letter = left(Utf8("APACHE"),Int64(1))
+02)--TableScan: simple_string projection=[letter]
 physical_plan
-ProjectionExec: expr=[letter@0 as letter, letter@0 = A as simple_string.letter = left(Utf8("APACHE"),Int64(1))]
---MemoryExec: partitions=1, partition_sizes=[1]
+01)ProjectionExec: expr=[letter@0 as letter, letter@0 = A as simple_string.letter = left(Utf8("APACHE"),Int64(1))]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TB
 SELECT letter, letter = LEFT('APACHE', 1) FROM simple_string;
@@ -2050,11 +1867,11 @@ query TT
 EXPLAIN SELECT letter, letter = LEFT(letter2, 1) FROM simple_string;
 ----
 logical_plan
-Projection: simple_string.letter, simple_string.letter = left(simple_string.letter2, Int64(1))
---TableScan: simple_string projection=[letter, letter2]
+01)Projection: simple_string.letter, simple_string.letter = CAST(left(simple_string.letter2, Int64(1)) AS Utf8View)
+02)--TableScan: simple_string projection=[letter, letter2]
 physical_plan
-ProjectionExec: expr=[letter@0 as letter, letter@0 = left(letter2@1, 1) as simple_string.letter = left(simple_string.letter2,Int64(1))]
---MemoryExec: partitions=1, partition_sizes=[1]
+01)ProjectionExec: expr=[letter@0 as letter, letter@0 = CAST(left(letter2@1, 1) AS Utf8View) as simple_string.letter = left(simple_string.letter2,Int64(1))]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 query TB
 SELECT letter, letter = LEFT(letter2, 1) FROM simple_string;
@@ -2066,7 +1883,7 @@ D false
 
 # test string_temporal_coercion
 query BBBBBBBBBB
-select 
+select
   arrow_cast(to_timestamp('2020-01-01 01:01:11.1234567890Z'), 'Timestamp(Second, None)') == '2020-01-01T01:01:11',
   arrow_cast(to_timestamp('2020-01-02 01:01:11.1234567890Z'), 'Timestamp(Second, None)') == arrow_cast('2020-01-02T01:01:11', 'LargeUtf8'),
   arrow_cast(to_timestamp('2020-01-03 01:01:11.1234567890Z'), 'Time32(Second)') == '01:01:11',
@@ -2115,7 +1932,7 @@ select 100000 where position('legend' in 'league of legend') = 11;
 100000
 
 # test null
-query ?
+query I
 select position(null in null)
 ----
 NULL
@@ -2126,10 +1943,8 @@ select position('' in '')
 ----
 1
 
-
-query error DataFusion error: Execution error: The STRPOS/INSTR/POSITION function can only accept strings, but got Int64.
+query error DataFusion error: Error during planning: Internal error: Expect TypeSignatureClass::Native\(LogicalType\(Native\(String\), String\)\) but received NativeType::Int64, DataType: Int64
 select position(1 in 1)
-
 
 query I
 select strpos('abc', 'c');
@@ -2202,3 +2017,37 @@ query I
 select strpos('joséésoj', arrow_cast(null, 'Utf8'));
 ----
 NULL
+
+statement ok
+CREATE TABLE t1 (v1 int) AS VALUES (1), (2), (3);
+
+query I
+SELECT * FROM t1 ORDER BY ACOS(SIN(v1));
+----
+2
+1
+3
+
+query I
+SELECT * FROM t1 ORDER BY ACOSH(SIN(v1));
+----
+1
+2
+3
+
+query I
+SELECT * FROM t1 ORDER BY ASIN(SIN(v1));
+----
+3
+1
+2
+
+query I
+SELECT * FROM t1 ORDER BY ATANH(SIN(v1));
+----
+3
+1
+2
+
+statement ok
+drop table t1;

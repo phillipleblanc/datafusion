@@ -17,18 +17,17 @@
 
 //! A wrapper around `hashbrown::RawTable` that allows entries to be tracked by index
 
-use crate::aggregates::group_values::primitive::HashValue;
+use crate::aggregates::group_values::HashValue;
 use crate::aggregates::topk::heap::Comparable;
 use ahash::RandomState;
-use arrow::datatypes::i256;
-use arrow_array::builder::PrimitiveBuilder;
-use arrow_array::cast::AsArray;
-use arrow_array::{
-    downcast_primitive, Array, ArrayRef, ArrowPrimitiveType, PrimitiveArray, StringArray,
+use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
+use arrow::array::{
+    Array, ArrayRef, ArrowPrimitiveType, LargeStringArray, PrimitiveArray, StringArray,
+    StringViewArray, builder::PrimitiveBuilder, cast::AsArray, downcast_primitive,
 };
-use arrow_schema::DataType;
-use datafusion_common::DataFusionError;
+use arrow::datatypes::{DataType, i256};
 use datafusion_common::Result;
+use datafusion_common::exec_datafusion_err;
 use half::f16;
 use hashbrown::raw::RawTable;
 use std::fmt::Debug;
@@ -89,6 +88,7 @@ pub struct StringHashTable {
     owned: ArrayRef,
     map: TopKHashTable<Option<String>>,
     rnd: RandomState,
+    data_type: DataType,
 }
 
 // An implementation of ArrowHashTable for any `ArrowPrimitiveType` key
@@ -99,16 +99,24 @@ where
     owned: ArrayRef,
     map: TopKHashTable<Option<VAL::Native>>,
     rnd: RandomState,
+    kt: DataType,
 }
 
 impl StringHashTable {
-    pub fn new(limit: usize) -> Self {
+    pub fn new(limit: usize, data_type: DataType) -> Self {
         let vals: Vec<&str> = Vec::new();
-        let owned = Arc::new(StringArray::from(vals));
+        let owned: ArrayRef = match data_type {
+            DataType::Utf8 => Arc::new(StringArray::from(vals)),
+            DataType::Utf8View => Arc::new(StringViewArray::from(vals)),
+            DataType::LargeUtf8 => Arc::new(LargeStringArray::from(vals)),
+            _ => panic!("Unsupported data type"),
+        };
+
         Self {
             owned,
             map: TopKHashTable::new(limit, limit * 10),
-            rnd: ahash::RandomState::default(),
+            rnd: RandomState::default(),
+            data_type,
         }
     }
 }
@@ -123,16 +131,25 @@ impl ArrowHashTable for StringHashTable {
     }
 
     unsafe fn update_heap_idx(&mut self, mapper: &[(usize, usize)]) {
-        self.map.update_heap_idx(mapper);
+        unsafe {
+            self.map.update_heap_idx(mapper);
+        }
     }
 
     unsafe fn heap_idx_at(&self, map_idx: usize) -> usize {
-        self.map.heap_idx_at(map_idx)
+        unsafe { self.map.heap_idx_at(map_idx) }
     }
 
     unsafe fn take_all(&mut self, indexes: Vec<usize>) -> ArrayRef {
-        let ids = self.map.take_all(indexes);
-        Arc::new(StringArray::from(ids))
+        unsafe {
+            let ids = self.map.take_all(indexes);
+            match self.data_type {
+                DataType::Utf8 => Arc::new(StringArray::from(ids)),
+                DataType::LargeUtf8 => Arc::new(LargeStringArray::from(ids)),
+                DataType::Utf8View => Arc::new(StringViewArray::from(ids)),
+                _ => unreachable!(),
+            }
+        }
     }
 
     unsafe fn find_or_insert(
@@ -141,32 +158,63 @@ impl ArrowHashTable for StringHashTable {
         replace_idx: usize,
         mapper: &mut Vec<(usize, usize)>,
     ) -> (usize, bool) {
-        let ids = self
-            .owned
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("StringArray required");
-        let id = if ids.is_null(row_idx) {
-            None
-        } else {
-            Some(ids.value(row_idx))
-        };
+        unsafe {
+            let id = match self.data_type {
+                DataType::Utf8 => {
+                    let ids = self
+                        .owned
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("Expected StringArray for DataType::Utf8");
+                    if ids.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(ids.value(row_idx))
+                    }
+                }
+                DataType::LargeUtf8 => {
+                    let ids = self
+                        .owned
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .expect("Expected LargeStringArray for DataType::LargeUtf8");
+                    if ids.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(ids.value(row_idx))
+                    }
+                }
+                DataType::Utf8View => {
+                    let ids = self
+                        .owned
+                        .as_any()
+                        .downcast_ref::<StringViewArray>()
+                        .expect("Expected StringViewArray for DataType::Utf8View");
+                    if ids.is_null(row_idx) {
+                        None
+                    } else {
+                        Some(ids.value(row_idx))
+                    }
+                }
+                _ => panic!("Unsupported data type"),
+            };
 
-        let hash = self.rnd.hash_one(id);
-        if let Some(map_idx) = self
-            .map
-            .find(hash, |mi| id == mi.as_ref().map(|id| id.as_str()))
-        {
-            return (map_idx, false);
+            let hash = self.rnd.hash_one(id);
+            if let Some(map_idx) = self
+                .map
+                .find(hash, |mi| id == mi.as_ref().map(|id| id.as_str()))
+            {
+                return (map_idx, false);
+            }
+
+            // we're full and this is a better value, so remove the worst
+            let heap_idx = self.map.remove_if_full(replace_idx);
+
+            // add the new group
+            let id = id.map(|id| id.to_string());
+            let map_idx = self.map.insert(hash, id, heap_idx, mapper);
+            (map_idx, true)
         }
-
-        // we're full and this is a better value, so remove the worst
-        let heap_idx = self.map.remove_if_full(replace_idx);
-
-        // add the new group
-        let id = id.map(|id| id.to_string());
-        let map_idx = self.map.insert(hash, id, heap_idx, mapper);
-        (map_idx, true)
     }
 }
 
@@ -175,12 +223,17 @@ where
     Option<<VAL as ArrowPrimitiveType>::Native>: Comparable,
     Option<<VAL as ArrowPrimitiveType>::Native>: HashValue,
 {
-    pub fn new(limit: usize) -> Self {
-        let owned = Arc::new(PrimitiveArray::<VAL>::builder(0).finish());
+    pub fn new(limit: usize, kt: DataType) -> Self {
+        let owned = Arc::new(
+            PrimitiveArray::<VAL>::builder(0)
+                .with_data_type(kt.clone())
+                .finish(),
+        );
         Self {
             owned,
             map: TopKHashTable::new(limit, limit * 10),
-            rnd: ahash::RandomState::default(),
+            rnd: RandomState::default(),
+            kt,
         }
     }
 }
@@ -199,24 +252,29 @@ where
     }
 
     unsafe fn update_heap_idx(&mut self, mapper: &[(usize, usize)]) {
-        self.map.update_heap_idx(mapper);
+        unsafe {
+            self.map.update_heap_idx(mapper);
+        }
     }
 
     unsafe fn heap_idx_at(&self, map_idx: usize) -> usize {
-        self.map.heap_idx_at(map_idx)
+        unsafe { self.map.heap_idx_at(map_idx) }
     }
 
     unsafe fn take_all(&mut self, indexes: Vec<usize>) -> ArrayRef {
-        let ids = self.map.take_all(indexes);
-        let mut builder: PrimitiveBuilder<VAL> = PrimitiveArray::builder(ids.len());
-        for id in ids.into_iter() {
-            match id {
-                None => builder.append_null(),
-                Some(id) => builder.append_value(id),
+        unsafe {
+            let ids = self.map.take_all(indexes);
+            let mut builder: PrimitiveBuilder<VAL> =
+                PrimitiveArray::builder(ids.len()).with_data_type(self.kt.clone());
+            for id in ids.into_iter() {
+                match id {
+                    None => builder.append_null(),
+                    Some(id) => builder.append_value(id),
+                }
             }
+            let ids = builder.finish();
+            Arc::new(ids)
         }
-        let ids = builder.finish();
-        Arc::new(ids)
     }
 
     unsafe fn find_or_insert(
@@ -225,24 +283,26 @@ where
         replace_idx: usize,
         mapper: &mut Vec<(usize, usize)>,
     ) -> (usize, bool) {
-        let ids = self.owned.as_primitive::<VAL>();
-        let id: Option<VAL::Native> = if ids.is_null(row_idx) {
-            None
-        } else {
-            Some(ids.value(row_idx))
-        };
+        unsafe {
+            let ids = self.owned.as_primitive::<VAL>();
+            let id: Option<VAL::Native> = if ids.is_null(row_idx) {
+                None
+            } else {
+                Some(ids.value(row_idx))
+            };
 
-        let hash: u64 = id.hash(&self.rnd);
-        if let Some(map_idx) = self.map.find(hash, |mi| id == *mi) {
-            return (map_idx, false);
+            let hash: u64 = id.hash(&self.rnd);
+            if let Some(map_idx) = self.map.find(hash, |mi| id == *mi) {
+                return (map_idx, false);
+            }
+
+            // we're full and this is a better value, so remove the worst
+            let heap_idx = self.map.remove_if_full(replace_idx);
+
+            // add the new group
+            let map_idx = self.map.insert(hash, id, heap_idx, mapper);
+            (map_idx, true)
         }
-
-        // we're full and this is a better value, so remove the worst
-        let heap_idx = self.map.remove_if_full(replace_idx);
-
-        // add the new group
-        let map_idx = self.map.insert(hash, id, heap_idx, mapper);
-        (map_idx, true)
     }
 }
 
@@ -264,22 +324,28 @@ impl<ID: KeyType> TopKHashTable<ID> {
     }
 
     pub unsafe fn heap_idx_at(&self, map_idx: usize) -> usize {
-        let bucket = unsafe { self.map.bucket(map_idx) };
-        bucket.as_ref().heap_idx
+        unsafe {
+            let bucket = self.map.bucket(map_idx);
+            bucket.as_ref().heap_idx
+        }
     }
 
     pub unsafe fn remove_if_full(&mut self, replace_idx: usize) -> usize {
-        if self.map.len() >= self.limit {
-            self.map.erase(self.map.bucket(replace_idx));
-            0 // if full, always replace top node
-        } else {
-            self.map.len() // if we're not full, always append to end
+        unsafe {
+            if self.map.len() >= self.limit {
+                self.map.erase(self.map.bucket(replace_idx));
+                0 // if full, always replace top node
+            } else {
+                self.map.len() // if we're not full, always append to end
+            }
         }
     }
 
     unsafe fn update_heap_idx(&mut self, mapper: &[(usize, usize)]) {
-        for (m, h) in mapper {
-            self.map.bucket(*m).as_mut().heap_idx = *h
+        unsafe {
+            for (m, h) in mapper {
+                self.map.bucket(*m).as_mut().heap_idx = *h
+            }
         }
     }
 
@@ -320,12 +386,14 @@ impl<ID: KeyType> TopKHashTable<ID> {
     }
 
     pub unsafe fn take_all(&mut self, idxs: Vec<usize>) -> Vec<ID> {
-        let ids = idxs
-            .into_iter()
-            .map(|idx| self.map.bucket(idx).as_ref().id.clone())
-            .collect();
-        self.map.clear();
-        ids
+        unsafe {
+            let ids = idxs
+                .into_iter()
+                .map(|idx| self.map.bucket(idx).as_ref().id.clone())
+                .collect();
+            self.map.clear();
+            ids
+        }
     }
 }
 
@@ -363,31 +431,55 @@ macro_rules! has_integer {
 
 has_integer!(i8, i16, i32, i64, i128, i256);
 has_integer!(u8, u16, u32, u64);
+has_integer!(IntervalDayTime, IntervalMonthDayNano);
 hash_float!(f16, f32, f64);
 
-pub fn new_hash_table(limit: usize, kt: DataType) -> Result<Box<dyn ArrowHashTable>> {
+pub fn new_hash_table(
+    limit: usize,
+    kt: DataType,
+) -> Result<Box<dyn ArrowHashTable + Send>> {
     macro_rules! downcast_helper {
         ($kt:ty, $d:ident) => {
-            return Ok(Box::new(PrimitiveHashTable::<$kt>::new(limit)))
+            return Ok(Box::new(PrimitiveHashTable::<$kt>::new(limit, kt)))
         };
     }
 
     downcast_primitive! {
         kt => (downcast_helper, kt),
-        DataType::Utf8 => return Ok(Box::new(StringHashTable::new(limit))),
+        DataType::Utf8 => return Ok(Box::new(StringHashTable::new(limit, DataType::Utf8))),
+        DataType::LargeUtf8 => return Ok(Box::new(StringHashTable::new(limit, DataType::LargeUtf8))),
+        DataType::Utf8View => return Ok(Box::new(StringHashTable::new(limit, DataType::Utf8View))),
         _ => {}
     }
 
-    Err(DataFusionError::Execution(format!(
+    Err(exec_datafusion_err!(
         "Can't create HashTable for type: {kt:?}"
-    )))
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion_common::Result;
+    use arrow::array::TimestampMillisecondArray;
+    use arrow_schema::TimeUnit;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn should_emit_correct_type() -> Result<()> {
+        let ids =
+            TimestampMillisecondArray::from(vec![1000]).with_timezone("UTC".to_string());
+        let dt = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+        let mut ht = new_hash_table(1, dt.clone())?;
+        ht.set_batch(Arc::new(ids));
+        let mut mapper = vec![];
+        let ids = unsafe {
+            ht.find_or_insert(0, 0, &mut mapper);
+            ht.take_all(vec![0])
+        };
+        assert_eq!(ids.data_type(), &dt);
+
+        Ok(())
+    }
 
     #[test]
     fn should_resize_properly() -> Result<()> {
@@ -415,7 +507,7 @@ mod tests {
         let (_heap_idxs, map_idxs): (Vec<_>, Vec<_>) = heap_to_map.into_iter().unzip();
         let ids = unsafe { map.take_all(map_idxs) };
         assert_eq!(
-            format!("{:?}", ids),
+            format!("{ids:?}"),
             r#"[Some("1"), Some("2"), Some("3"), Some("4"), Some("5")]"#
         );
         assert_eq!(map.len(), 0, "Map should have been cleared!");
